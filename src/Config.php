@@ -21,6 +21,12 @@ final class Config
     /** The environment the ingest binds on: trimmed, lower-cased, and then exactly this pattern. */
     public const ENVIRONMENT_PATTERN = '/^[a-z][a-z0-9-]{0,63}$/';
 
+    /**
+     * schema 1.0 bounds the service name and the ingest bounds it nowhere. An over-long name is therefore
+     * accepted by the server and refused by the contract, which a customer only ever sees as an empty inbox.
+     */
+    public const MAX_SERVICE_CHARS = 128;
+
     private function __construct(
         public readonly string $endpoint,
         public readonly ?string $token,
@@ -55,6 +61,17 @@ final class Config
         if ($service === '') {
             $service = 'unknown-service';
             $logger->once('service', 'anvil-feed: no service name configured; sending is disabled.');
+        }
+
+        if (mb_strlen($service) > self::MAX_SERVICE_CHARS) {
+            $bounded = mb_substr($service, 0, self::MAX_SERVICE_CHARS);
+            $logger->once('service-length', sprintf(
+                'anvil-feed: the service name is longer than %d characters and was sent as "%s". '
+                . 'Configure it that way to avoid the rewrite.',
+                self::MAX_SERVICE_CHARS,
+                $bounded
+            ));
+            $service = $bounded;
         }
 
         $environment = self::normalizeEnvironment((string) ($options['environment'] ?? 'production'), $logger);

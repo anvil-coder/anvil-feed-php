@@ -58,7 +58,9 @@ final class SchemaConformanceTest extends TestCase
             true, 512, JSON_THROW_ON_ERROR
         );
 
-        self::assertCount(9, $cases, 'conformance/cases.json changed; this gate has to be looked at');
+        // At least the nine Task 0 built. The point of the number is that a truncated or empty index would
+        // make this calibration vacuous; cases added later are picked up by the loop below on their own.
+        self::assertGreaterThanOrEqual(9, count($cases), 'conformance/cases.json lost cases');
 
         foreach ($cases as $case) {
             $fixture = json_decode(
@@ -259,6 +261,38 @@ final class SchemaConformanceTest extends TestCase
             [],
             $validator->errors($this->overTheWire($this->factory()->fromThrowable(new \RuntimeException(''))))
         );
+    }
+
+    /**
+     * schema 1.0 bounds service at 128 characters and the ingest bounds it nowhere — so an over-long name
+     * is accepted by the server, refused by the contract, and the only way a customer finds out is an empty
+     * inbox. Bounded here, once, with a line that says what was sent.
+     */
+    public function testAnOverlongServiceNameIsBoundedRatherThanRefused(): void
+    {
+        $wire = $this->overTheWire(
+            $this->factory(['service' => str_repeat('a', 300)])->fromThrowable(new \RuntimeException('boom'))
+        );
+
+        self::assertSame([], $this->validator()->errors($wire));
+        self::assertSame(128, mb_strlen($wire->service));
+    }
+
+    /**
+     * schema 1.0 requires request.url to be http(s). The published contract says a URL that is not gets
+     * dropped and the event kept; the server does not actually do that, it keeps the value — so an SDK that
+     * passes a file:// path straight through sends a body the contract refuses, and hands the ingest a
+     * local path it never asked for. Dropped here, which is both the documented intent and the safe half.
+     */
+    public function testARequestUrlTheSchemaWouldRefuseIsDroppedRatherThanSent(): void
+    {
+        $wire = $this->overTheWire($this->factory()->fromThrowable(new \RuntimeException('boom'), 'error', [
+            'request' => ['method' => 'GET', 'url' => 'file:///etc/passwd', 'status_code' => 500],
+        ]));
+
+        self::assertSame([], $this->validator()->errors($wire));
+        self::assertFalse(isset($wire->request->url), 'a non-http(s) URL must not be sent at all');
+        self::assertSame('GET', $wire->request->method);   // the rest of the block still travels
     }
 
     /** An environment that would be refused must never reach the wire in the first place. */

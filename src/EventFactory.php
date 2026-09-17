@@ -121,10 +121,14 @@ final class EventFactory
             $payload['release'] = $release;
         }
         if (isset($context['request']) && is_array($context['request']) && $context['request'] !== []) {
+            // schema 1.0 requires http(s) here. A URL of any other scheme is dropped rather than sent: the
+            // documented intent is that the event survives without it, and a file:// path is somebody's
+            // local filesystem, which the ingest never asked for.
             $url = $context['request']['url'] ?? null;
+            $isWebUrl = is_string($url) && preg_match('~^https?://~i', $url) === 1;
             $payload['request'] = array_filter([
                 'method' => $context['request']['method'] ?? null,
-                'url' => is_string($url) ? $this->clip($url, self::MAX_SHORT_TEXT_CHARS) : null,
+                'url' => $isWebUrl ? $this->clip($url, self::MAX_SHORT_TEXT_CHARS) : null,
                 'status_code' => isset($context['request']['status_code'])
                     ? (int) $context['request']['status_code'] : null,
             ], static fn ($v) => $v !== null);

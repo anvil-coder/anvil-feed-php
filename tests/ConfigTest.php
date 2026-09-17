@@ -253,6 +253,37 @@ final class ConfigTest extends TestCase
         self::assertStringContainsString('no service name configured', $lines[0]);
     }
 
+    /**
+     * schema 1.0 stops at 128 and the ingest stops nowhere, so an over-long name is the quiet kind of
+     * mistake: accepted by the server, refused by the contract, visible only as an empty inbox.
+     */
+    public function testAnOverlongServiceNameIsBoundedAndSaidOnce(): void
+    {
+        [$logger, $lines] = $this->recordingLogger();
+        $config = Config::fromArray(
+            ['token' => 'anv_srv_x', 'service' => str_repeat('a', 300)],
+            $logger
+        );
+
+        self::assertSame(128, mb_strlen($config->service));
+        self::assertSame(Config::MAX_SERVICE_CHARS, mb_strlen($config->service));
+        self::assertTrue($config->enabled);
+        self::assertCount(1, $lines);
+        self::assertStringContainsString('longer than 128 characters', $lines[0]);
+    }
+
+    public function testAServiceNameExactlyAtTheBoundIsLeftAlone(): void
+    {
+        [$logger, $lines] = $this->recordingLogger();
+        $config = Config::fromArray(
+            ['token' => 'anv_srv_x', 'service' => str_repeat('a', 128)],
+            $logger
+        );
+
+        self::assertSame(128, mb_strlen($config->service));
+        self::assertSame([], $lines->getArrayCopy());
+    }
+
     public function testEnabledFalseIsHonouredEvenWhenEverythingElseIsFine(): void
     {
         [$config] = $this->valid(['enabled' => false]);
