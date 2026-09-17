@@ -84,6 +84,13 @@ final class JsonSchemaValidator
                 : [$path . ': shorter than ' . $argument],
             'maxLength' => !is_string($value) || mb_strlen($value) <= $argument ? []
                 : [$path . ': longer than ' . $argument . ' (' . mb_strlen($value) . ')'],
+            'maxItems' => !is_array($value) || count($value) <= $argument ? []
+                : [$path . ': more than ' . $argument . ' items (' . count($value) . ')'],
+            'maxProperties' => !$value instanceof \stdClass
+                || count(get_object_vars($value)) <= $argument ? []
+                : [$path . ': more than ' . $argument . ' properties ('
+                    . count(get_object_vars($value)) . ')'],
+            'format' => $this->formatErrors($value, $argument, $path),
             'minimum' => !is_int($value) && !is_float($value) || $value >= $argument ? []
                 : [$path . ': below ' . $argument],
             'required' => $this->requiredErrors($value, $argument, $path),
@@ -98,6 +105,52 @@ final class JsonSchemaValidator
                 . ', which this validator does not implement — extend it rather than let it pass silently'
             ),
         };
+    }
+
+    /**
+     * Only the formats schema 1.0 actually uses, and "date-time" is checked the way ajv-formats checks it:
+     * the grammar first, then the calendar. A pattern alone accepts 2026-02-30 and hour 25, and the server
+     * answers schema_violation to both because Instant.parse refuses them.
+     *
+     * @return list<string>
+     */
+    private function formatErrors(mixed $value, string $format, string $path): array
+    {
+        if (!is_string($value)) {
+            return [];
+        }
+
+        return match ($format) {
+            'date-time' => $this->isDateTime($value) ? []
+                : [$path . ': "' . $value . '" is not an RFC 3339 date-time'],
+            default => throw new \RuntimeException(
+                'the schema uses the format "' . $format . '" at ' . $path
+                . ', which this validator does not implement'
+            ),
+        };
+    }
+
+    private function isDateTime(string $value): bool
+    {
+        $grammar = '~^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(\.\d+)?([Zz]|[+-]\d{2}:\d{2})$~';
+        if (preg_match($grammar, $value, $parts) !== 1) {
+            return false;
+        }
+        if (!checkdate((int) $parts[2], (int) $parts[3], (int) $parts[1])) {
+            return false;
+        }
+        // Second 60 is the leap second RFC 3339 allows; the hour and minute have no such exception.
+        if ((int) $parts[4] > 23 || (int) $parts[5] > 59 || (int) $parts[6] > 60) {
+            return false;
+        }
+        $zone = $parts[8];
+        if ($zone !== 'Z' && $zone !== 'z') {
+            [$hours, $minutes] = explode(':', substr($zone, 1));
+
+            return (int) $hours <= 23 && (int) $minutes <= 59;
+        }
+
+        return true;
     }
 
     private function matchesType(mixed $value, string $type): bool

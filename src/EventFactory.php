@@ -28,7 +28,12 @@ final class EventFactory
     private const MAX_MESSAGE_CHARS = 2000;
     private const MAX_SHORT_TEXT_CHARS = 1000;
     private const MAX_BREADCRUMBS = 30;
-    private const MAX_TAGS = 30;
+    /**
+     * 29, not the ingest's MAX_TAGS of 30: AnvilFeedEventMapper.tags() writes the server's own
+     * user.ip_hash pseudonym into the first slot before any sender tag, so a sender that fills thirty
+     * loses one of them — silently, in the cockpit, weeks later.
+     */
+    private const MAX_TAGS = 29;
 
     public function __construct(
         private readonly Config $config,
@@ -100,7 +105,9 @@ final class EventFactory
             'schema_version' => '1.0',
             'event_id' => $id,
             'timestamp' => gmdate('Y-m-d\TH:i:s\Z'),
-            'title' => $title,
+            // title is required and must not be blank. A caught exception with no message and an empty
+            // log line are both real calls, and neither may cost the event.
+            'title' => trim($title) === '' ? $exception['type'] : $title,
             'level' => in_array($level, ['error', 'warning', 'fatal'], true) ? $level : 'error',
             'environment' => $this->config->environment,
             'service' => $this->config->service,

@@ -223,6 +223,44 @@ final class SchemaConformanceTest extends TestCase
         return $path;
     }
 
+    /**
+     * MAX_TAGS is 30 at the ingest, but AnvilFeedEventMapper.tags() puts the server's own user.ip_hash
+     * pseudonym into the FIRST slot before any sender tag, precisely so a sender cannot push it out. Thirty
+     * tags from the SDK therefore means thirty-one on arrival and one of them is dropped in silence — in
+     * the cockpit, weeks later, with no way to tell which.
+     */
+    public function testATagFloodStaysInsideTheSlotTheIngestLeavesForTheSender(): void
+    {
+        $tags = [];
+        for ($i = 1; $i <= 40; $i++) {
+            $tags['tag-' . $i] = 'value-' . $i;
+        }
+
+        $wire = $this->overTheWire(
+            $this->factory()->fromThrowable(new \RuntimeException('boom'), 'error', ['tags' => $tags])
+        );
+
+        self::assertSame([], $this->validator()->errors($wire));
+        self::assertLessThanOrEqual(29, count(get_object_vars($wire->tags)));
+        self::assertSame('value-1', $wire->tags->{'tag-1'});   // the FIRST are kept, as the ingest keeps them
+    }
+
+    /**
+     * A blank message is a real call — a caught exception with no message, a log line that turned out
+     * empty. title is required and must not be blank, so it cannot simply be the message.
+     */
+    public function testABlankMessageStillProducesASendableEvent(): void
+    {
+        $validator = $this->validator();
+
+        self::assertSame([], $validator->errors($this->overTheWire($this->factory()->fromMessage('   '))));
+        self::assertSame([], $validator->errors($this->overTheWire($this->factory()->fromMessage(''))));
+        self::assertSame(
+            [],
+            $validator->errors($this->overTheWire($this->factory()->fromThrowable(new \RuntimeException(''))))
+        );
+    }
+
     /** An environment that would be refused must never reach the wire in the first place. */
     public function testARepairedEnvironmentIsStillSchemaValid(): void
     {
