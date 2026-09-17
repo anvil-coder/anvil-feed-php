@@ -520,4 +520,22 @@ final class ConfigTest extends TestCase
         self::assertFalse($config->enabled);
         self::assertCount(2, $lines);   // one for the service, one for the token; neither repeats
     }
+
+    public function testAQueueBoundBelowOneIsClampedAndSaidOnce(): void
+    {
+        $written = new \AnvilFeed\Tests\Support\RecordingLogger();
+        $config = Config::fromArray([
+            'token' => 'anv_srv_0123456789abcdef0123456789abcdef',
+            'service' => 'disponio-api',
+            'max_queue_size' => 0,
+        ], new Logger($written));
+
+        self::assertSame(1, $config->maxQueueSize,
+            'a bound of zero is not a smaller queue, it is a queue that drops every event it is given '
+            . 'and writes a warning about each — a log flood on the code path that exists to prevent one');
+        self::assertCount(1, array_values(array_filter(
+            $written->lines,
+            static fn (string $line): bool => str_contains($line, 'max_queue_size')
+        )));
+    }
 }

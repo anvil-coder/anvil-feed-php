@@ -57,6 +57,12 @@ final class SenderTest extends TestCase
         );
     }
 
+    /** The answer the ingest actually gives: every id it stored, named. */
+    private function accepted(string ...$ids): string
+    {
+        return (string) json_encode(['accepted' => array_values($ids), 'rejected' => []]);
+    }
+
     private function fixture(string $name): string
     {
         $body = file_get_contents(__DIR__ . '/../../../conformance/responses/' . $name);
@@ -84,7 +90,8 @@ final class SenderTest extends TestCase
         $queue = $this->queue();
         $queue->push($this->event('11111111-1111-4111-8111-111111111111'));
         $queue->push($this->event('22222222-2222-4222-8222-222222222222'));
-        $transport = new RecordingTransport(new Response(202, '{"accepted":[],"rejected":[]}'));
+        $transport = new RecordingTransport(new Response(202, $this->accepted(
+            '11111111-1111-4111-8111-111111111111', '22222222-2222-4222-8222-222222222222')));
 
         $this->sender($queue, $transport)->flush();
 
@@ -183,7 +190,7 @@ final class SenderTest extends TestCase
         $transport = new RecordingTransport(
             new Response(400, $this->fixture('400-schema-violation.json')),
             new Response(400, $this->fixture('400-schema-violation.json')),
-            new Response(202, '{"accepted":[],"rejected":[]}')
+            new Response(202, $this->accepted('33333333-3333-4333-8333-333333333333'))
         );
 
         $sender = $this->sender($queue, $transport);
@@ -223,7 +230,8 @@ final class SenderTest extends TestCase
         $queue->push($this->event('22222222-2222-4222-8222-222222222222'));
         $transport = new RecordingTransport(
             new Response(503, $this->fixture('503-transient.json'), 30),
-            new Response(202, '{"accepted":[],"rejected":[]}')
+            new Response(202, $this->accepted(
+                '11111111-1111-4111-8111-111111111111', '22222222-2222-4222-8222-222222222222'))
         );
 
         $sender = $this->sender($queue, $transport);
@@ -315,7 +323,7 @@ final class SenderTest extends TestCase
             Response::failure('connection refused'),
             Response::failure('connection refused'),
             Response::failure('connection refused'),
-            new Response(202, '{"accepted":[],"rejected":[]}'),
+            new Response(202, $this->accepted('11111111-1111-4111-8111-111111111111')),
             Response::failure('connection refused')
         );
 
@@ -340,8 +348,10 @@ final class SenderTest extends TestCase
         }
         $transport = new RecordingTransport(
             new Response(413, $this->fixture('413-payload-too-large.json')),
-            new Response(202, '{"accepted":[],"rejected":[]}'),
-            new Response(202, '{"accepted":[],"rejected":[]}')
+            new Response(202, $this->accepted('11111111-1111-4111-8111-000000000000',
+                '11111111-1111-4111-8111-000000000001')),
+            new Response(202, $this->accepted('11111111-1111-4111-8111-000000000002',
+                '11111111-1111-4111-8111-000000000003'))
         );
 
         $this->sender($queue, $transport)->flush();
@@ -432,7 +442,8 @@ final class SenderTest extends TestCase
         $queue->push(new Event('11111111-1111-4111-8111-111111111111',
             ['event_id' => '11111111-1111-4111-8111-111111111111', 'title' => "\xB1\x31 invalid utf-8"]));
         $queue->push($this->event('22222222-2222-4222-8222-222222222222'));
-        $transport = new RecordingTransport(new Response(202, '{"accepted":[],"rejected":[]}'));
+        $transport = new RecordingTransport(new Response(202,
+            $this->accepted('22222222-2222-4222-8222-222222222222')));
 
         $this->sender($queue, $transport)->flush();
 
@@ -447,7 +458,7 @@ final class SenderTest extends TestCase
         $queue = $this->queue();
         $queue->push($this->event('11111111-1111-4111-8111-111111111111'));
         $throwing = new class implements \AnvilFeed\Transport\Transport {
-            public function post(string $url, string $body): \AnvilFeed\Transport\Response
+            public function post(string $url, string $body, ?int $timeoutMs = null): \AnvilFeed\Transport\Response
             {
                 throw new \RuntimeException('the host application\'s HTTP client exploded');
             }
@@ -493,5 +504,218 @@ final class SenderTest extends TestCase
         $this->sender($this->queue(), $transport)->flush();
 
         self::assertSame([], $transport->calls, 'a shutdown hook on a healthy request must cost nothing');
+    }
+
+    public function testARedirectIsDroppedAndNamedRatherThanCountedAsAnUnexpectedStatus(): void
+    {
+        $queue = $this->queue();
+        $queue->push($this->event('11111111-1111-4111-8111-111111111111'));
+        $transport = new RecordingTransport(
+            new Response(301, '', null, false, '', 'https://elsewhere.example/api/feed/events'),
+            new Response(301, '', null, false, '', 'https://elsewhere.example/api/feed/events')
+        );
+
+        $sender = $this->sender($queue, $transport);
+        $sender->flush();
+        $queue->push($this->event('22222222-2222-4222-8222-222222222222'));
+        $sender->flush();
+
+        self::assertSame(0, $queue->count(), 'a redirect cannot be retried into success');
+        self::assertFalse($sender->isStopped());
+        $said = $this->written->matching('never follows a redirect');
+        self::assertCount(1, $said, 'said once per process, like every other permanent refusal');
+        self::assertStringContainsString('https://elsewhere.example/api/feed/events', $said[0],
+            'the Location is the one thing that tells the operator what their endpoint is really pointing at');
+        self::assertStringContainsString('301', $said[0]);
+    }
+
+    public function testEachRequestGetsWhatIsLeftOfTheFlushDeadlineAsItsBudget(): void
+    {
+        $queue = $this->queue();
+        foreach (range(0, 2) as $i) {
+            $queue->push($this->event(sprintf('11111111-1111-4111-8111-%012d', $i)));
+        }
+        // One event per batch, and every request costs 0.8 s of the 2 s the flush promised the host.
+        $slow = new class ($this) implements \AnvilFeed\Transport\Transport {
+            /** @var list<?int> */
+            public array $budgets = [];
+
+            public function __construct(private readonly SenderTest $test)
+            {
+            }
+
+            public function post(string $url, string $body, ?int $timeoutMs = null): Response
+            {
+                $this->budgets[] = $timeoutMs;
+                $this->test->advance(0.8);
+
+                return new Response(202, RecordingTransport::acceptEverything($body));
+            }
+        };
+
+        $sender = new Sender($this->config(['batch_size' => 1]), $queue, $slow, new Logger($this->written),
+            fn (): float => $this->now);
+        $sender->flush();
+
+        self::assertSame([2000, 1200, 400], $slow->budgets,
+            'a deadline that only decides whether the NEXT request may start lets a flush run to '
+            . 'deadline + request_timeout_ms — 4s against FR-2 (c)\'s 2s');
+    }
+
+    public function testTheBudgetNeverExceedsTheConfiguredRequestTimeout(): void
+    {
+        $queue = $this->queue();
+        $queue->push($this->event('11111111-1111-4111-8111-111111111111'));
+        $transport = new RecordingTransport();
+
+        // A caller asking for ten seconds does not get ten seconds of socket.
+        $this->sender($queue, $transport)->flush($this->now + 10.0);
+
+        self::assertSame([10000], $transport->budgets(),
+            'the Sender hands over what is left of the deadline it was given; clamping that down to '
+            . 'request_timeout_ms is the transport\'s job and is proved in '
+            . 'DirectTransportTest::testAGenerousCallerBudgetIsStillClampedToTheConfiguredTimeout');
+    }
+
+    public function testOnceMeansOncePerProcessEvenWithASecondLoggerInstance(): void
+    {
+        $queue = $this->queue();
+        $queue->push($this->event('11111111-1111-4111-8111-111111111111'));
+        $transport = new RecordingTransport(
+            new Response(403, ''),
+            new Response(403, '')
+        );
+
+        // Two Logger objects over one sink — a service provider that news one up per binding. Logger::once
+        // is per instance, so this is exactly the wiring that would double every "said once" line.
+        $sender = new Sender(
+            Config::fromArray([
+                'token' => 'anv_srv_0123456789abcdef0123456789abcdef',
+                'service' => 'disponio-api',
+            ], new Logger($this->written)),
+            $queue,
+            $transport,
+            new Logger($this->written),
+            fn (): float => $this->now
+        );
+        $sender->flush();
+        $queue->push($this->event('22222222-2222-4222-8222-222222222222'));
+        $sender->flush();
+
+        self::assertCount(1, $this->written->matching('403'),
+            'the once-flag belongs to the Sender, not to whichever Logger the host happened to inject');
+    }
+
+    public function testAPauseResetsTheBackoffBecauseTheIngestAnsweredAtAll(): void
+    {
+        $queue = $this->queue();
+        $queue->push($this->event('11111111-1111-4111-8111-111111111111'));
+        $transport = new RecordingTransport(
+            Response::failure('connection refused'),
+            Response::failure('connection refused'),
+            Response::failure('connection refused'),
+            new Response(429, '', 60),
+            Response::failure('connection refused')
+        );
+
+        $sender = $this->sender($queue, $transport);
+        for ($attempt = 0; $attempt < 3; $attempt++) {
+            $sender->flush();
+            $this->now = $sender->pausedUntil() + 0.001;
+        }
+        $sender->flush();                       // the 429
+        $this->now = $sender->pausedUntil() + 0.001;
+        $sender->flush();                       // fails again — as a FIRST failure
+
+        self::assertLessThanOrEqual($this->now + 1.2, $sender->pausedUntil(),
+            'a 429 is a healthy answer from a reachable ingest; carrying a failure streak across it '
+            . 'resumes at the escalated delay after a pause that proved the opposite');
+        self::assertGreaterThanOrEqual($this->now + 0.8, $sender->pausedUntil());
+    }
+
+    public function testAnEventTheIngestNeverNamedIsSentOnceMoreAndThenDropped(): void
+    {
+        $queue = $this->queue();
+        $queue->push($this->event('11111111-1111-4111-8111-111111111111'));
+        // A proxy that rewrote the body, a truncated answer, an `accepted` list re-spelled: the status is
+        // 202 and the event is in neither list.
+        $transport = new RecordingTransport(
+            new Response(202, '{"accepted":[],"rejected":[]}'),
+            new Response(202, '{"accepted":[],"rejected":[]}'),
+            new Response(202, '{"accepted":[],"rejected":[]}')
+        );
+
+        $this->sender($queue, $transport)->flush();
+
+        self::assertCount(2, $transport->calls, 'exactly one more attempt — dedup makes the repeat safe');
+        self::assertSame(0, $queue->count(), 'and then it goes, or the queue never empties again');
+        self::assertNotSame([], $this->written->matching('202 twice without naming it'));
+        self::assertNotSame([], $this->written->matching('11111111-1111-4111-8111-111111111111'),
+            'the event that was lost is named; a count would not let anybody find it');
+    }
+
+    public function testAnAnswerThatNamesOnlySomeOfTheBatchKeepsOnlyTheRest(): void
+    {
+        $queue = $this->queue();
+        $queue->push($this->event('11111111-1111-4111-8111-111111111111'));
+        $queue->push($this->event('22222222-2222-4222-8222-222222222222'));
+        $transport = new RecordingTransport(
+            new Response(202, '{"accepted":["11111111-1111-4111-8111-111111111111"],"rejected":[]}')
+        );
+
+        $this->sender($queue, $transport)->flush();
+
+        self::assertCount(2, $transport->calls);
+        $second = json_decode($transport->calls[1]['body'], true);
+        self::assertIsArray($second);
+        self::assertSame('22222222-2222-4222-8222-222222222222', $second['event_id'] ?? null,
+            'only the event that got no verdict goes again; the accepted one is done');
+        self::assertSame(0, $queue->count());
+    }
+
+    public function testAnUnreadable202DoesNotClearTheBatchOnTheStrengthOfTheStatusAlone(): void
+    {
+        $queue = $this->queue();
+        $queue->push($this->event('11111111-1111-4111-8111-111111111111'));
+        $transport = new RecordingTransport(
+            new Response(202, '<html>a proxy error page with a 202 status</html>')
+        );
+
+        $this->sender($queue, $transport)->flush();
+
+        self::assertCount(2, $transport->calls, 'the second attempt reaches the healthy default answer');
+        self::assertSame(0, $queue->count());
+    }
+
+    public function testACredentialInATransportFailureNeverReachesTheLog(): void
+    {
+        $queue = $this->queue();
+        $queue->push($this->event('11111111-1111-4111-8111-111111111111'));
+        $leaking = new class implements \AnvilFeed\Transport\Transport {
+            public function post(string $url, string $body, ?int $timeoutMs = null): Response
+            {
+                // A host's own debugging decorator dumping the request it failed on.
+                throw new \RuntimeException(
+                    "request failed: POST /api/feed/events\nAuthorization: Bearer "
+                    . 'anv_srv_0123456789abcdef0123456789abcdef'
+                );
+            }
+        };
+
+        $sender = new Sender($this->config(), $queue, $leaking, new Logger($this->written),
+            fn (): float => $this->now);
+        $sender->flush();
+
+        $lines = implode("\n", $this->written->lines);
+        self::assertStringNotContainsString('anv_srv_0123456789abcdef0123456789abcdef', $lines,
+            'FR-9 (e): the SDK keeps this promise itself rather than trusting every host client');
+        self::assertStringNotContainsString('Bearer anv_srv', $lines);
+        self::assertStringContainsString('[Filtered]', $lines, 'and says that something was removed');
+    }
+
+    /** Used by the slow transport above to move the injected clock. */
+    public function advance(float $seconds): void
+    {
+        $this->now += $seconds;
     }
 }

@@ -18,8 +18,16 @@ final class Queue
 
     private int $dropped = 0;
 
-    public function __construct(private readonly int $maxSize, private readonly Logger $logger)
+    private readonly int $maxSize;
+
+    /**
+     * A bound of zero or less would make every push a drop plus a warning — a log flood on the one code
+     * path that exists to prevent one — and a negative one would make droppedCount() over-report. Config
+     * clamps it too; this is the guard for a Queue somebody constructs directly.
+     */
+    public function __construct(int $maxSize, private readonly Logger $logger)
     {
+        $this->maxSize = max(1, $maxSize);
     }
 
     public function push(Event $event): void

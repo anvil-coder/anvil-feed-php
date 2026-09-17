@@ -83,6 +83,20 @@ final class QueueTest extends TestCase
         self::assertCount(6, $queue->take(99), 'asking for more than there is returns what there is');
     }
 
+    public function testABoundBelowOneIsRefusedRatherThanTurningEveryPushIntoADropAndAWarning(): void
+    {
+        foreach ([0, -1, -1000] as $nonsense) {
+            $queue = $this->queue($nonsense);
+            $queue->push(new Event('a', []));
+            $queue->push(new Event('b', []));
+
+            self::assertSame(1, $queue->count(), "a bound of {$nonsense} must behave as a bound of one");
+            self::assertSame(1, $queue->droppedCount(),
+                'a negative bound would make the overflow exceed the queue and over-report drops');
+            self::assertSame(['b'], array_map(static fn (Event $e) => $e->id, $queue->take(1)));
+        }
+    }
+
     public function testClearEmptiesIt(): void
     {
         $queue = $this->queue(10);

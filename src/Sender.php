@@ -39,6 +39,24 @@ final class Sender
     /** …and `Retry-After: 30` with every 503. */
     private const DEFAULT_TRANSIENT_PAUSE_SECONDS = 30;
 
+    /**
+     * "Once per process" (ruling P3) lives HERE and not in the Logger: Logger::once() is per instance, so
+     * a host that news up a second Logger — a Laravel provider binding one per service is the obvious way
+     * — would get every "said once" line twice, and the symptom is a repeated paragraph in a log nobody
+     * files a ticket about. A Sender is one per process by design, so this flag is the process flag.
+     *
+     * @var array<string, true>
+     */
+    private array $said = [];
+
+    /**
+     * Events the ingest answered 202 for without naming them in `accepted` or `rejected`. They get one
+     * more attempt and are then dropped — see applyVerdicts().
+     *
+     * @var array<string, true>
+     */
+    private array $awaitingSecondTry = [];
+
     private float $pausedUntil = 0.0;
     private int $consecutiveFailures = 0;
     private bool $stopped = false;
@@ -102,7 +120,7 @@ final class Sender
         } catch (\Throwable $neverTheHostsProblem) {
             // The last line of FR-2 b. Everything below is already defensive; this is what makes the
             // promise true even for the case nobody thought of.
-            $this->logger->once('flush-defect', 'anvil-feed: internal error while sending — '
+            $this->sayOnce('flush-defect', 'anvil-feed: internal error while sending — '
                 . $neverTheHostsProblem->getMessage() . '. Events are dropped rather than raised.');
         } finally {
             $this->deadline = INF;
@@ -132,7 +150,8 @@ final class Sender
         try {
             $response = $this->transport->post(
                 count($batch) === 1 ? $this->config->eventsUrl() : $this->config->batchUrl(),
-                $body
+                $body,
+                $this->remainingBudgetMs()
             );
         } catch (\Throwable $never) {
             // A Transport is contractually not allowed to throw. If one does, it is treated as a
@@ -141,6 +160,20 @@ final class Sender
         }
 
         return $this->apply($batch, $response);
+    }
+
+    /**
+     * What is left of the flush deadline, in milliseconds. FR-2 (c)'s 2 s is a bound on the CALL, so it
+     * has to reach the socket: a deadline that only decides whether the next request may start still
+     * lets a flush run to deadline + request_timeout_ms.
+     */
+    private function remainingBudgetMs(): int
+    {
+        if (!is_finite($this->deadline)) {
+            return $this->config->requestTimeoutMs;
+        }
+
+        return max(1, (int) round(($this->deadline - ($this->clock)()) * 1000));
     }
 
     /**
@@ -184,7 +217,7 @@ final class Sender
     private function tooLarge(array $batch, Response $response): bool
     {
         $this->consecutiveFailures = 0;
-        $this->logger->once('status:413', sprintf(
+        $this->sayOnce('status:413', sprintf(
             'anvil-feed: the ingest answered 413 (%s): %s Halving the batch and trying the halves.',
             self::firstReasonCode($response),
             self::firstMessage($response)
@@ -222,11 +255,12 @@ final class Sender
         $now = ($this->clock)();
 
         if ($response->transportFailure) {
-            return $this->backOff($batch, $now, 'transport failure: ' . $response->failureReason);
+            return $this->backOff($batch, $now,
+                'transport failure: ' . Response::redact($response->failureReason));
         }
 
         return match (true) {
-            $response->status === 202 => $this->applyVerdicts($response),
+            $response->status === 202 => $this->applyVerdicts($batch, $response),
             $response->status === 400 => $this->drop($batch, 400, 'the ingest answered 400 ('
                 . self::firstReasonCode($response) . '): it refused the whole request — '
                 . self::firstMessage($response) . '. This is a defect in the SDK or a batch above 50; '
@@ -244,31 +278,90 @@ final class Sender
                 'transient store failure; the whole batch is repeated'),
             $response->status >= 500 => $this->backOff($batch, $now, 'the ingest answered '
                 . $response->status),
+            $response->status >= 300 && $response->status < 400 => $this->redirected($batch, $response),
             default => $this->drop($batch, $response->status,
                 'the ingest answered an unexpected ' . $response->status),
         };
     }
 
     /**
-     * A 202 is final for every event in the batch — accepted and rejected alike (responses/index.json:
-     * "a verdict, even a refusing one, still clears that event from the buffer"). Nothing is resent; what
-     * is left to do is to say why the refused ones were refused.
+     * A 202 is final for every event the answer NAMES — accepted and rejected alike
+     * (responses/index.json: "a verdict, even a refusing one, still clears that event from the buffer").
+     *
+     * An event the answer does not name is a different case. The ingest promises exactly one verdict per
+     * event, so this cannot happen against a healthy server — but a truncated body, a proxy that rewrote
+     * the response, or an `accepted` list re-spelled in lower case all produce it, and clearing the whole
+     * batch on the strength of the status code alone loses those events with no line anywhere. They get
+     * ONE more attempt — (organisation, event_id) is the delivery key, so a repeat of something that did
+     * land is counted once — and are then dropped, by name, because the alternative is a queue that never
+     * empties.
+     *
+     * @param list<Event> $batch
      */
-    private function applyVerdicts(Response $response): bool
+    private function applyVerdicts(array $batch, Response $response): bool
     {
         $this->consecutiveFailures = 0;
-        $answer = json_decode($response->body, true);
-        if (!is_array($answer)) {
-            return true;   // 202 with an unreadable body: the events are stored, nothing to resend
+        $verdicts = $this->readVerdicts($response);
+
+        $requeue = [];
+        foreach ($batch as $event) {
+            if (isset($verdicts[$event->id])) {
+                unset($this->awaitingSecondTry[$event->id]);
+                continue;
+            }
+            if (isset($this->awaitingSecondTry[$event->id])) {
+                unset($this->awaitingSecondTry[$event->id]);
+                $this->logger->warning(sprintf(
+                    'anvil-feed: dropping event %s — the ingest answered 202 twice without naming it in '
+                    . 'accepted or rejected. Something between this process and the ingest is rewriting '
+                    . 'the answer.',
+                    $event->id
+                ));
+                continue;
+            }
+            $this->awaitingSecondTry[$event->id] = true;
+            $requeue[] = $event;
         }
 
-        $rejected = $answer['rejected'] ?? [];
-        if (!is_array($rejected)) {
-            return true;
+        if ($requeue !== []) {
+            $this->sayOnce('unverdicted', sprintf(
+                'anvil-feed: the ingest answered 202 without a verdict for %d event(s) of the batch; they '
+                . 'are sent once more and then dropped. Every event is supposed to be named in accepted '
+                . 'or in rejected.',
+                count($requeue)
+            ));
+            $this->queue->unshiftAll($requeue);
         }
-        foreach ($rejected as $rejection) {
+
+        return true;
+    }
+
+    /**
+     * The ids the answer names, spelled exactly as the ingest returned them — which is exactly as the
+     * sender posted them (AnvilFeedIngestController keeps the sender's spelling on purpose). Logs each
+     * rejection on the way past.
+     *
+     * @return array<string, true>
+     */
+    private function readVerdicts(Response $response): array
+    {
+        $answer = json_decode($response->body, true);
+        if (!is_array($answer)) {
+            return [];
+        }
+
+        $verdicts = [];
+        foreach (is_array($answer['accepted'] ?? null) ? $answer['accepted'] : [] as $id) {
+            if (is_string($id)) {
+                $verdicts[$id] = true;
+            }
+        }
+        foreach (is_array($answer['rejected'] ?? null) ? $answer['rejected'] : [] as $rejection) {
             if (!is_array($rejection)) {
                 continue;
+            }
+            if (is_string($rejection['event_id'] ?? null)) {
+                $verdicts[$rejection['event_id']] = true;
             }
             $code = (string) ($rejection['reason_code'] ?? 'unknown');
             $message = sprintf(
@@ -280,18 +373,22 @@ final class Sender
             // Two of the seven reason codes are the operator's problem, not the developer's, and they will
             // otherwise repeat on every single event until somebody notices.
             in_array($code, ['no_binding', 'binding_disabled'], true)
-                ? $this->logger->once('reason:' . $code, $message
+                ? $this->sayOnce('reason:' . $code, $message
                     . ' — connect the environment in the Anvil cockpit.')
                 : $this->logger->warning($message);
         }
 
-        return true;
+        return $verdicts;
     }
 
     /** @param list<Event> $batch */
     private function pause(array $batch, float $now, int $seconds, string $why): bool
     {
         $seconds = max(0, $seconds);
+        // A 429 or a 503 is a healthy answer from a reachable ingest: the connection works and the server
+        // is talking to us. Carrying a transport-failure streak across it would resume at the escalated
+        // delay after a pause that proved the opposite.
+        $this->consecutiveFailures = 0;
         $this->queue->unshiftAll($batch);
         $this->pausedUntil = $now + $seconds;
         $this->logger->warning(sprintf('anvil-feed: paused for %ds (%s).', $seconds, $why));
@@ -328,10 +425,35 @@ final class Sender
     private function drop(array $batch, int $status, string $why): bool
     {
         $this->consecutiveFailures = 0;
-        $this->logger->once('status:' . $status, sprintf(
+        $this->sayOnce('status:' . $status, sprintf(
             'anvil-feed: dropped %d event(s) — %s Further events refused this way are dropped silently.',
             count($batch),
             $why
+        ));
+
+        return true;
+    }
+
+    /**
+     * A redirect is never followed, on any path (see DirectTransport). Two reasons, either of which is
+     * enough: following it presents the `anv_srv_` token to a host the customer never configured, and the
+     * redirect degrades POST to GET, so the events would not even be in the second request — and the
+     * redirect target's 2xx would be read as a delivery.
+     *
+     * @param list<Event> $batch
+     */
+    private function redirected(array $batch, Response $response): bool
+    {
+        $this->consecutiveFailures = 0;
+        $this->sayOnce('redirect', sprintf(
+            'anvil-feed: %s answered %d%s and this SDK never follows a redirect — the ingest token is '
+            . 'presented to the configured endpoint and to nothing else. Configure "endpoint" as the '
+            . 'address the ingest actually answers on. %d event(s) dropped; further ones are dropped '
+            . 'silently.',
+            $this->config->endpoint,
+            $response->status,
+            $response->location === null ? '' : ' (Location: ' . $response->location . ')',
+            count($batch)
         ));
 
         return true;
@@ -341,9 +463,19 @@ final class Sender
     {
         $this->stopped = true;
         $this->queue->clear();
-        $this->logger->once('stopped', 'anvil-feed: ' . $why);
+        $this->sayOnce('stopped', 'anvil-feed: ' . $why);
 
         return false;
+    }
+
+    /** Ruling P3's "once per process". See $said. */
+    private function sayOnce(string $key, string $message): void
+    {
+        if (isset($this->said[$key])) {
+            return;
+        }
+        $this->said[$key] = true;
+        $this->logger->warning($message);
     }
 
     private static function firstMessage(Response $response): string

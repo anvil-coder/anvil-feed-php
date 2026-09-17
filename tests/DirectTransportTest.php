@@ -31,7 +31,15 @@ final class DirectTransportTest extends TestCase
             escapeshellarg(__DIR__ . '/Support/echo-server.php')
         );
         $pipes = [];
-        $process = proc_open($command, [1 => ['file', '/dev/null', 'w'], 2 => ['file', '/dev/null', 'w']], $pipes);
+        // Several workers: two of the tests below deliberately hold a connection open for seconds, and a
+        // single-threaded server would make every later test in the class time out instead.
+        $process = proc_open(
+            $command,
+            [1 => ['file', '/dev/null', 'w'], 2 => ['file', '/dev/null', 'w']],
+            $pipes,
+            null,
+            ['PHP_CLI_SERVER_WORKERS' => '6'] + getenv()
+        );
         if (!is_resource($process)) {
             return;
         }
@@ -90,15 +98,131 @@ final class DirectTransportTest extends TestCase
 
     private function transport(bool $useCurl): DirectTransport
     {
-        if (self::$base === '') {
-            self::markTestSkipped('no local HTTP server could be started for the transport proof');
-        }
+        self::assertNotSame('', self::$base, 'no local HTTP server could be started — this suite is the '
+            . 'only place the bundled transport is proved against a real socket, so a run without it is '
+            . 'a failed run, not a skipped one');
 
         return new DirectTransport(Config::fromArray([
             'endpoint' => self::$base . '/api/feed',
             'token' => 'anv_srv_0123456789abcdef0123456789abcdef',
             'service' => 'disponio-api',
         ], new Logger()), $useCurl);
+    }
+
+    private function boundedTransport(bool $useCurl, int $connectMs, int $requestMs): DirectTransport
+    {
+        self::assertNotSame('', self::$base, 'the local HTTP server is required for this proof');
+
+        return new DirectTransport(Config::fromArray([
+            'endpoint' => self::$base . '/api/feed',
+            'token' => 'anv_srv_0123456789abcdef0123456789abcdef',
+            'service' => 'disponio-api',
+            'connect_timeout_ms' => $connectMs,
+            'request_timeout_ms' => $requestMs,
+        ], new Logger()), $useCurl);
+    }
+
+    /**
+     * FR-9, and the finding that made this file worth writing: the stream wrapper follows redirects by
+     * default AND re-sends the request headers, so one operator typo in `endpoint` hands the `anv_srv_`
+     * token to a host the customer never named — while the redirect degrades POST to GET, so the events
+     * are not in the second request and the target's answer is read as a delivery.
+     */
+    #[\PHPUnit\Framework\Attributes\DataProvider('bothPaths')]
+    public function testARedirectIsNeverFollowedAndTheTokenNeverReachesTheTarget(bool $useCurl): void
+    {
+        $marker = bin2hex(random_bytes(8));
+        $targetFile = sys_get_temp_dir() . '/anvil-feed-redirect-target-' . $marker;
+        @unlink($targetFile);
+
+        $response = $this->transport($useCurl)->post(self::$base . '/redirect?marker=' . $marker, '{}');
+
+        self::assertFileDoesNotExist($targetFile,
+            'the redirect target received a request — and with it the Authorization header');
+        self::assertSame(302, $response->status, 'the 3xx is handed to the Sender, which drops the batch '
+            . 'and says the endpoint is misconfigured');
+        self::assertSame('/elsewhere?marker=' . $marker, $response->location,
+            'the Location is carried so the log line can name where the endpoint wanted to send the token');
+        self::assertFalse($response->transportFailure);
+    }
+
+    /**
+     * FR-2 (a)/(c): the timeout is a bound on the whole exchange. The server sends its headers and then
+     * one byte every 100 ms against a 400 ms budget; the measured failure before this was 12.14 s and a
+     * reported *success*.
+     */
+    #[\PHPUnit\Framework\Attributes\DataProvider('bothPaths')]
+    public function testAServerThatDribblesIsCutOffAtTheBudgetRatherThanHeldOpen(bool $useCurl): void
+    {
+        $transport = $this->boundedTransport($useCurl, 200, 400);
+
+        $started = microtime(true);
+        $response = $transport->post(self::$base . '/dribble', '{}');
+        $elapsed = microtime(true) - $started;
+
+        self::assertLessThan(1.2, $elapsed, sprintf(
+            'a 400 ms budget must not become %.2fs — on a host without ext-curl this runs inside the '
+            . 'application\'s shutdown path', $elapsed
+        ));
+        self::assertTrue($response->transportFailure,
+            'an answer that never finished is a transport failure, not a delivery: the events must stay '
+            . 'in the queue');
+    }
+
+    /** The budget the SENDER passes wins when it is smaller than the configured request timeout. */
+    #[\PHPUnit\Framework\Attributes\DataProvider('bothPaths')]
+    public function testTheCallersBudgetBoundsTheRequest(bool $useCurl): void
+    {
+        $transport = $this->boundedTransport($useCurl, 200, 5000);
+
+        $started = microtime(true);
+        $response = $transport->post(self::$base . '/dribble', '{}', 300);
+        $elapsed = microtime(true) - $started;
+
+        self::assertLessThan(1.2, $elapsed, 'flush() promised the host 2 s; the transport has to honour '
+            . 'what is left of it');
+        self::assertTrue($response->transportFailure);
+    }
+
+    /** The configured `request_timeout_ms` is the ceiling; a generous caller cannot raise it. */
+    #[\PHPUnit\Framework\Attributes\DataProvider('bothPaths')]
+    public function testAGenerousCallerBudgetIsStillClampedToTheConfiguredTimeout(bool $useCurl): void
+    {
+        $transport = $this->boundedTransport($useCurl, 200, 300);
+
+        $started = microtime(true);
+        $response = $transport->post(self::$base . '/dribble', '{}', 10_000);
+        $elapsed = microtime(true) - $started;
+
+        self::assertLessThan(1.2, $elapsed,
+            'request_timeout_ms is what the operator set; a caller asking for ten seconds does not get them');
+        self::assertTrue($response->transportFailure);
+    }
+
+    /**
+     * Finding 3: `connect_timeout_ms` was read only on the curl path. 192.0.2.1 is TEST-NET-1 (RFC 5737)
+     * — routed nowhere, so the connect hangs rather than being refused.
+     */
+    #[\PHPUnit\Framework\Attributes\DataProvider('bothPaths')]
+    public function testConnectTimeoutIsHonouredOnBothPaths(bool $useCurl): void
+    {
+        $transport = new DirectTransport(Config::fromArray([
+            'endpoint' => 'http://192.0.2.1/api/feed',
+            'token' => 'anv_srv_0123456789abcdef0123456789abcdef',
+            'service' => 'disponio-api',
+            'connect_timeout_ms' => 300,
+            'request_timeout_ms' => 5000,
+        ], new Logger()), $useCurl);
+
+        $started = microtime(true);
+        $response = $transport->post('http://192.0.2.1/api/feed/events', '{}');
+        $elapsed = microtime(true) - $started;
+
+        self::assertTrue($response->transportFailure);
+        self::assertLessThan(2.0, $elapsed, sprintf(
+            'connect_timeout_ms is 300; %.2fs means the setting is ignored and the default socket timeout '
+            . '(60s here) is what a customer actually gets', $elapsed
+        ));
     }
 
     #[\PHPUnit\Framework\Attributes\DataProvider('bothPaths')]

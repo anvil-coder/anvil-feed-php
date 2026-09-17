@@ -105,7 +105,11 @@ final class Config
             service: $service,
             environment: $environment ?? 'production',
             release: self::stringOrNull($options['release'] ?? null),
-            maxQueueSize: self::intOption($options, 'max_queue_size', 1000, $logger),
+            maxQueueSize: self::atLeastOne(
+                self::intOption($options, 'max_queue_size', 1000, $logger),
+                'max_queue_size',
+                $logger
+            ),
             flushIntervalMs: self::intOption($options, 'flush_interval_ms', 2000, $logger),
             batchSize: min(50, max(1, self::intOption($options, 'batch_size', 50, $logger))),
             connectTimeoutMs: self::intOption($options, 'connect_timeout_ms', 1000, $logger),
@@ -279,6 +283,26 @@ final class Config
         // "false" out of an .env file is a string, and (bool) "false" is true — which would silently
         // switch the SDK back ON for somebody who had switched it off.
         return filter_var($options[$key], FILTER_VALIDATE_BOOL, FILTER_NULL_ON_FAILURE) ?? $default;
+    }
+
+    /**
+     * A queue bound of zero or less is not a smaller queue, it is a queue that drops every event it is
+     * given and writes a warning about each — a log flood on the one code path that exists to prevent
+     * one. Clamped, and said once, the way the environment repair is.
+     */
+    private static function atLeastOne(int $value, string $key, Logger $logger): int
+    {
+        if ($value >= 1) {
+            return $value;
+        }
+        $logger->once('clamp:' . $key, sprintf(
+            'anvil-feed: "%s" is %d; 1 is used instead — a bound below one would drop every event and '
+            . 'write a warning about each.',
+            $key,
+            $value
+        ));
+
+        return 1;
     }
 
     private static function sayItIsUnreadable(
