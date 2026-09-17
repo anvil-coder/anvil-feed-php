@@ -291,6 +291,174 @@ final class ConfigTest extends TestCase
         self::assertFalse($config->enabled);
     }
 
+    // ------------------------------------------------- FR-2 b: fromArray() is total
+
+    /**
+     * `'denylist' => env('ANVIL_DENYLIST')` answers a STRING, and the promoted constructor parameter is
+     * typed array — so this exact line used to raise a TypeError out of the SDK and take the host's boot
+     * down with it. FR-2 b says no error inside this SDK ever reaches the caller; a config file a customer
+     * wrote by hand is precisely where that promise is tested.
+     */
+    public function testASingleValueWhereAListWasMeantIsWrappedRatherThanThrown(): void
+    {
+        [$logger, $lines] = $this->recordingLogger();
+        $config = Config::fromArray(
+            ['token' => 'anv_srv_x', 'service' => 'svc', 'denylist' => 'passphrase',
+                'ignored_request_paths' => '/health'],
+            $logger
+        );
+
+        self::assertSame(['passphrase'], $config->denylist);
+        self::assertSame(['/health'], $config->ignoredRequestPaths);
+        self::assertCount(2, $lines);
+        self::assertStringContainsString('"denylist" is a list of strings', $lines[0]);
+        self::assertStringContainsString('"ignored_request_paths" is a list of strings', $lines[1]);
+    }
+
+    public function testAListOptionThatCannotBeReadAtAllFallsBackToItsDefault(): void
+    {
+        [$logger, $lines] = $this->recordingLogger();
+        $config = Config::fromArray(
+            ['token' => 'anv_srv_x', 'service' => 'svc', 'denylist' => 42],
+            $logger
+        );
+
+        self::assertSame(Config::DEFAULT_DENYLIST, $config->denylist);
+        self::assertCount(1, $lines);
+        self::assertStringContainsString('must be a list of strings but is int', $lines[0]);
+    }
+
+    /** A list with rubbish in it keeps the usable entries; Scrubber must never be handed a non-string. */
+    public function testNonStringEntriesAreDroppedFromAListOption(): void
+    {
+        [$logger] = $this->recordingLogger();
+        $config = Config::fromArray(
+            ['token' => 'anv_srv_x', 'service' => 'svc', 'denylist' => ['token', ['nested'], 7, 'iban']],
+            $logger
+        );
+
+        self::assertSame(['token', 'iban'], $config->denylist);
+    }
+
+    /**
+     * `trim((string) $value)` on an array is a PHP warning, and Laravel installs an error handler that
+     * turns a warning into a thrown ErrorException — so on the one host this SDK is built for, the warning
+     * IS a throw into the caller. Nothing here may raise one.
+     */
+    public function testANonStringServiceDisablesTheClientWithOneLineAndNoWarning(): void
+    {
+        [$logger, $lines] = $this->recordingLogger();
+        $config = Config::fromArray(['token' => 'anv_srv_x', 'service' => ['svc']], $logger);
+
+        self::assertSame('unknown-service', $config->service);
+        self::assertFalse($config->enabled);
+        self::assertCount(1, $lines);
+        self::assertStringContainsString('must be a string but is array', $lines[0]);
+    }
+
+    public function testANonStringEndpointOrEnvironmentFallsBackAndSaysSo(): void
+    {
+        [$logger, $lines] = $this->recordingLogger();
+        $config = Config::fromArray(
+            ['token' => 'anv_srv_x', 'service' => 'svc', 'endpoint' => ['https://x'], 'environment' => 7],
+            $logger
+        );
+
+        self::assertSame(Config::DEFAULT_ENDPOINT, $config->endpoint);
+        self::assertSame('production', $config->environment);
+        self::assertCount(2, $lines);
+    }
+
+    /** "abc" read as 0 would switch a timeout off without telling anybody. */
+    public function testANumberThatIsNotANumberFallsBackToItsDefault(): void
+    {
+        [$logger, $lines] = $this->recordingLogger();
+        $config = Config::fromArray(
+            ['token' => 'anv_srv_x', 'service' => 'svc', 'request_timeout_ms' => 'abc',
+                'max_queue_size' => []],
+            $logger
+        );
+
+        self::assertSame(2000, $config->requestTimeoutMs);
+        self::assertSame(1000, $config->maxQueueSize);
+        self::assertCount(2, $lines);
+        $said = implode(' | ', $lines->getArrayCopy());
+        self::assertStringContainsString('"request_timeout_ms" must be a whole number but is string', $said);
+        self::assertStringContainsString('"max_queue_size" must be a whole number but is array', $said);
+    }
+
+    /** A number out of an .env file is a string, and that one IS readable. */
+    public function testANumericStringIsReadAsTheNumberItIs(): void
+    {
+        [$logger, $lines] = $this->recordingLogger();
+        $config = Config::fromArray(
+            ['token' => 'anv_srv_x', 'service' => 'svc', 'request_timeout_ms' => '250',
+                'max_queue_size' => ' 40 ', 'batch_size' => 10.0],
+            $logger
+        );
+
+        self::assertSame(250, $config->requestTimeoutMs);
+        self::assertSame(40, $config->maxQueueSize);
+        self::assertSame(10, $config->batchSize);
+        self::assertSame([], $lines->getArrayCopy());
+    }
+
+    /** (bool) "false" is true, which would switch the SDK back on for somebody who switched it off. */
+    public function testTheStringFalseSwitchesTheClientOff(): void
+    {
+        foreach (['false', '0', 'off', 'no'] as $spelling) {
+            [$logger] = $this->recordingLogger();
+            $config = Config::fromArray(
+                ['token' => 'anv_srv_x', 'service' => 'svc', 'enabled' => $spelling],
+                $logger
+            );
+
+            self::assertFalse($config->enabled, $spelling);
+        }
+
+        [$logger] = $this->recordingLogger();
+        self::assertTrue(
+            Config::fromArray(['token' => 'anv_srv_x', 'service' => 'svc', 'enabled' => 'true'], $logger)
+                ->enabled
+        );
+    }
+
+    /**
+     * The whole door at once: every option the wrong type, nothing raised, and a Config that is still a
+     * Config. If this ever throws, a customer's application does not boot.
+     */
+    public function testAConfigurationOfPureRubbishStillProducesAConfig(): void
+    {
+        [$logger] = $this->recordingLogger();
+        $config = Config::fromArray([
+            'endpoint' => ['x'], 'token' => ['x'], 'service' => 1.5, 'environment' => new \stdClass(),
+            'release' => [], 'max_queue_size' => 'x', 'flush_interval_ms' => [], 'batch_size' => null,
+            'connect_timeout_ms' => new \stdClass(), 'request_timeout_ms' => 'x', 'max_frames' => [],
+            'context_lines' => 'x', 'max_context_line_chars' => [], 'denylist' => new \stdClass(),
+            'enabled' => [], 'fingerprint_cap' => 'x', 'fingerprint_window_ms' => [],
+            'ignored_request_paths' => 3.5,
+        ], $logger);
+
+        self::assertSame(Config::DEFAULT_ENDPOINT, $config->endpoint);
+        self::assertNull($config->token);
+        self::assertSame('unknown-service', $config->service);
+        self::assertSame('production', $config->environment);
+        self::assertNull($config->release);
+        self::assertSame(1000, $config->maxQueueSize);
+        self::assertSame(2000, $config->flushIntervalMs);
+        self::assertSame(50, $config->batchSize);
+        self::assertSame(1000, $config->connectTimeoutMs);
+        self::assertSame(2000, $config->requestTimeoutMs);
+        self::assertSame(50, $config->maxFrames);
+        self::assertSame(20, $config->contextLines);
+        self::assertSame(400, $config->maxContextLineChars);
+        self::assertSame(Config::DEFAULT_DENYLIST, $config->denylist);
+        self::assertSame(10, $config->fingerprintCap);
+        self::assertSame(60000, $config->fingerprintWindowMs);
+        self::assertSame(['/api/feed/**'], $config->ignoredRequestPaths);
+        self::assertFalse($config->enabled);   // no token and no service: nothing would be sent anyway
+    }
+
     // ------------------------------------------------------------- the environment
 
     public function testTheFiveEnvironmentVariablesAreRead(): void

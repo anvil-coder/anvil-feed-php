@@ -71,13 +71,38 @@ final class SchemaConformanceTest extends TestCase
 
             if ($case['valid']) {
                 self::assertSame([], $errors, $case['file'] . ' should validate');
-            } else {
-                self::assertNotSame(
-                    [],
-                    $errors,
-                    $case['file'] . ' should NOT validate — it is ' . $case['reason_code'] . ' at the ingest'
-                );
+                continue;
             }
+
+            self::assertNotSame(
+                [],
+                $errors,
+                $case['file'] . ' should NOT validate — it is ' . ($case['reason_code'] ?? 'forbidden')
+                    . ' at the ingest'
+            );
+
+            // conformance/README.md: `violates` names the ONE keyword the runner requires to be among
+            // the reported errors, so a fixture that starts failing for the wrong reason reddens instead
+            // of printing ok by accident. Asserting only "something was wrong" is how that coverage is
+            // lost silently, and the two runners are supposed to be independent checks of one index.
+            if (!isset($case['violates'])) {
+                continue;
+            }
+            $pointer = '#' . $case['violates']['instancePath'];
+            self::assertNotSame(
+                [],
+                array_values(array_filter(
+                    $errors,
+                    static fn (string $error) => str_starts_with($error, $pointer . ':')
+                )),
+                sprintf(
+                    '%s must fail at %s (keyword "%s"), but failed only at: %s',
+                    $case['file'],
+                    $pointer,
+                    $case['violates']['keyword'],
+                    implode(' | ', $errors)
+                )
+            );
         }
     }
 
@@ -190,6 +215,11 @@ final class SchemaConformanceTest extends TestCase
                 mb_strlen($wire->exception->stacktrace[0]->context_code),
                 'the probe file must fill the context window, or the 1000-character bound is never reached'
             );
+            self::assertStringContainsString(
+                "token = '[Filtered]'",
+                $wire->exception->stacktrace[0]->context_code,
+                'the probe must actually be redacted, or it never exercises growth across the cap'
+            );
 
             // And the two text bounds, on a message far beyond both.
             $long = $this->overTheWire(
@@ -204,12 +234,17 @@ final class SchemaConformanceTest extends TestCase
     }
 
     /**
-     * Twenty-five lines of 400 characters around one throw: the window the SDK captures is then 8000-odd
-     * characters before it is bounded, which is the case schema 1.0 refuses.
+     * Twenty-five lines of 400 characters around one throw, and every one of them packed with SHORT
+     * denylist assignments — `$token = 'y';` — because those are the ones redaction makes LONGER:
+     * eleven characters become twenty. A probe of plain padding reaches the 1000-character bound (which
+     * is what the earlier proxy fix was about) but never crosses it from the far side, and crossing it
+     * from the far side is the whole of finding 2. With this padding the captured window is roughly
+     * eight thousand characters before redaction and grows by about two thousand during it.
      */
     private function generateAProbeFileOfLongLines(): string
     {
-        $padding = '// ' . str_repeat('x', 397);
+        $secrets = "\$token = 'y'; \$secret = 'z'; \$password = 'q'; ";
+        $padding = '// ' . mb_substr(str_repeat($secrets, 12), 0, 397);
         $lines = ['<?php', ''];
         for ($i = 0; $i < 12; $i++) {
             $lines[] = $padding;
@@ -293,6 +328,79 @@ final class SchemaConformanceTest extends TestCase
         self::assertSame([], $this->validator()->errors($wire));
         self::assertFalse(isset($wire->request->url), 'a non-http(s) URL must not be sent at all');
         self::assertSame('GET', $wire->request->method);   // the rest of the block still travels
+    }
+
+    /**
+     * A request context holding nothing the contract accepts must drop the whole block, not leave an empty
+     * PHP array behind — `json_encode([])` is `[]`, and schema 1.0 types request as an object.
+     *
+     * This is the console-command and queue-worker shape: no method, no status code, and a URL that is not
+     * http(s). Every event such a handler produced would be refused for a field it never needed to send.
+     */
+    public function testARequestWithNothingSendableLeftIsDroppedRatherThanEmptied(): void
+    {
+        $wire = $this->overTheWire($this->factory()->fromThrowable(new \RuntimeException('boom'), 'error', [
+            'request' => ['url' => 'file:///etc/passwd'],
+        ]));
+
+        self::assertSame([], $this->validator()->errors($wire));
+        self::assertFalse(isset($wire->request), 'an empty request block must not be sent at all');
+    }
+
+    /** The same shape one field over: tags whose only member is the key the scrubber removes. */
+    public function testTagsWhoseOnlyMemberIsTheIngestsOwnPseudonymAreDropped(): void
+    {
+        $wire = $this->overTheWire($this->factory()->fromThrowable(new \RuntimeException('boom'), 'error', [
+            'tags' => ['user.ip_hash' => 'deadbeef'],
+        ]));
+
+        self::assertSame([], $this->validator()->errors($wire));
+        self::assertFalse(isset($wire->tags), 'an empty tags block must not be sent at all');
+    }
+
+    /**
+     * Finding 2, the general case: every bounded text at cap-minus-a-few with a denylist term at the end,
+     * so redaction grows it past the cap. Clipping before redacting passes all of these and sends five
+     * refused events; clipping after redacting is the server's own order (IncidentRedaction.redact).
+     */
+    public function testRedactionGrowsTextAndEveryCapStillHolds(): void
+    {
+        // The denylist term goes at the FRONT of each value, not at the end. clip() keeps the first
+        // max-12 characters, so a term parked at the end is simply cut away and the value never grows —
+        // which is how the first draft of this test passed against the very order it was written to catch.
+        // "token=ab" (8) becomes "token=[Filtered]" (16), so each value starts one under its cap and
+        // finishes seven over it.
+        $nearTitleCap = 'token=ab ' . str_repeat('t', 502);          // 511 -> 519, cap 512
+        $nearShortCap = 'token=ab ' . str_repeat('b', 990);          // 999 -> 1007, cap 1000
+        $nearMessageCap = 'token=ab ' . str_repeat('m', 1990);       // 1999 -> 2007, cap 2000
+        $nearUrlCap = 'https://app.example/x?token=ab&q=' . str_repeat('u', 962);   // 995 -> 1003
+
+        $wire = $this->overTheWire($this->factory()->fromMessage($nearTitleCap, 'warning', [
+            'request' => ['method' => 'GET', 'url' => $nearUrlCap],
+            'tags' => ['k' => $nearShortCap],
+            'breadcrumbs' => [$nearShortCap],
+        ]));
+
+        self::assertSame([], $this->validator()->errors($wire));
+        self::assertLessThanOrEqual(512, mb_strlen($wire->title));
+        self::assertLessThanOrEqual(1000, mb_strlen($wire->request->url));
+        self::assertLessThanOrEqual(1000, mb_strlen($wire->tags->k));
+        self::assertLessThanOrEqual(1000, mb_strlen($wire->breadcrumbs[0]));
+
+        $longMessage = $this->overTheWire(
+            $this->factory()->fromThrowable(new \RuntimeException($nearMessageCap))
+        );
+        self::assertSame([], $this->validator()->errors($longMessage));
+        self::assertLessThanOrEqual(2000, mb_strlen($longMessage->exception->message));
+
+        // The negative controls. Each value must really have been over its cap after redaction — a test
+        // whose inputs all fit would pass under either order and guard nothing.
+        self::assertSame(512, mb_strlen($wire->title));
+        self::assertSame(1000, mb_strlen($wire->request->url));
+        self::assertSame(1000, mb_strlen($wire->tags->k));
+        self::assertSame(1000, mb_strlen($wire->breadcrumbs[0]));
+        self::assertSame(2000, mb_strlen($longMessage->exception->message));
+        self::assertStringNotContainsString('token=ab ', json_encode($wire, JSON_THROW_ON_ERROR));
     }
 
     /** An environment that would be refused must never reach the wire in the first place. */

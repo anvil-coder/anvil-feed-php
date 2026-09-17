@@ -125,6 +125,68 @@ final class EventFactoryTest extends TestCase
         self::assertSame(['id' => 'u-4711'], $payload['user']);
     }
 
+    /**
+     * sdk.version is what tells support which SDK a customer is running. Spelled twice, it drifts on the
+     * first tag and the answer support reads is the old one; this is the test that reddens on a release
+     * bump that forgets the constant.
+     */
+    public function testTheSdkVersionHasExactlyOneSource(): void
+    {
+        $payload = $this->factory()->fromThrowable(new \RuntimeException('boom'))->payload;
+
+        self::assertSame(EventFactory::SDK_VERSION, $payload['sdk']['version']);
+        self::assertMatchesRegularExpression('/^\d+\.\d+\.\d+/', EventFactory::SDK_VERSION);
+        self::assertSame('anvil-feed-php', $payload['sdk']['name']);
+        self::assertSame('server', $payload['sdk']['runtime']);
+    }
+
+    /**
+     * in_app is what IncidentFingerprint.topFrames partitions on, so a vendor frame that claims to be
+     * application code changes the fingerprint — and a Windows developer machine would then open its own
+     * incident for a fault production already has.
+     */
+    public function testVendorFramesAreNotInAppOnEitherPathSeparator(): void
+    {
+        self::assertFalse(EventFactory::isInApp('/app/vendor/anvil-coder/anvil-feed-php/src/Client.php'));
+        self::assertFalse(EventFactory::isInApp('C:\\proj\\vendor\\anvil-coder\\src\\Client.php'));
+        self::assertFalse(EventFactory::isInApp(''));
+
+        self::assertTrue(EventFactory::isInApp('/app/src/CheckoutService.php'));
+        self::assertTrue(EventFactory::isInApp('C:\\proj\\src\\CheckoutService.php'));
+        // "vendorish" is application code; the rule is a path segment, not a substring.
+        self::assertTrue(EventFactory::isInApp('/app/vendorish/Checkout.php'));
+    }
+
+    /** The same rule, reached through a real trace: PHPUnit's own frames live under vendor/. */
+    public function testARealVendorFrameIsMarkedNotInApp(): void
+    {
+        $frames = $this->factory()->fromThrowable(new \RuntimeException('boom'))->payload['exception']['stacktrace'];
+        $vendor = array_values(array_filter(
+            $frames,
+            static fn (array $f) => str_contains((string) $f['file'], '/vendor/')
+        ));
+
+        self::assertNotEmpty($vendor, 'this test only means something if PHPUnit frames are in the trace');
+        foreach ($vendor as $frame) {
+            self::assertFalse($frame['in_app'], $frame['file'] . ' is vendor code');
+        }
+        self::assertTrue($frames[0]['in_app'], 'the throw site is this test file, which is app code');
+    }
+
+    /** Finding 1, at the factory: the blocks the contract types as objects are dropped, never emptied. */
+    public function testBlocksThatEndUpEmptyAreDroppedRatherThanSentAsAnEmptyArray(): void
+    {
+        $payload = $this->factory()->fromThrowable(new \RuntimeException('boom'), 'error', [
+            'request' => ['url' => 'file:///etc/passwd'],
+            'tags' => ['user.ip_hash' => 'deadbeef'],
+        ])->payload;
+
+        self::assertArrayNotHasKey('request', $payload);
+        self::assertArrayNotHasKey('tags', $payload);
+        self::assertStringNotContainsString('"request":[]', $payload === [] ? '' : json_encode($payload));
+        self::assertStringNotContainsString('"tags":[]', json_encode($payload));
+    }
+
     /** Z1: the canonical JSON is what goes on the wire, and nothing may re-order it. */
     public function testCanonicalJsonStartsWithTheSchemaVersion(): void
     {

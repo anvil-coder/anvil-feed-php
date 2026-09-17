@@ -222,9 +222,14 @@ final class JsonSchemaValidator
         if (!$value instanceof \stdClass) {
             return [];
         }
+        // Reported AT the object, not at the property: cases.json's `violates` pointer for
+        // sdk-forbidden/tag-user-ip-hash.json is {instancePath: "/tags", keyword: "propertyNames"}, which
+        // is where ajv reports it, and the two runners have to agree on the location as well as the verdict.
         $errors = [];
         foreach (array_keys(get_object_vars($value)) as $name) {
-            $errors = [...$errors, ...$this->check((string) $name, $subSchema, $path . '/' . $name . ' (name)')];
+            if ($this->check((string) $name, $subSchema, $path) !== []) {
+                $errors[] = $path . ': the property name "' . $name . '" is not allowed';
+            }
         }
 
         return $errors;

@@ -31,9 +31,12 @@ final class Scrubber
     /** @param list<string> $denylist */
     public function __construct(array $denylist)
     {
+        // A denylist entry that is not a string is ignored rather than cast: "(string) []" is a PHP
+        // warning, and Laravel's error handler turns a warning into a thrown ErrorException — inside the
+        // constructor of the object whose whole job is to keep this SDK out of the host's way (FR-2 b).
         $terms = array_values(array_filter(array_map(
-            static fn ($term) => strtolower(trim((string) $term)),
-            $denylist
+            static fn (string $term) => strtolower(trim($term)),
+            array_filter($denylist, static fn ($term) => is_string($term))
         ), static fn (string $term) => $term !== ''));
 
         $this->normalizedTerms = array_map(
@@ -88,26 +91,61 @@ final class Scrubber
     }
 
     /**
+     * FR-5 e. Three things happen here and the order matters:
+     *
+     *   1. The fragment is split off first. It is not part of the query, and folding it into the last
+     *      parameter's value meant "?token=abc#section" scrubbed to "?token=[Filtered]" — the fragment
+     *      silently eaten. A reader of the cockpit assumes the scrubbed URL is the sent URL minus its
+     *      secrets, and it has to be exactly that.
+     *   2. Userinfo is removed: "https://admin:hunter2@host/x" carries a credential with no key at all,
+     *      so neither the parameter walk here nor IncidentRedaction's KV_SECRET on the server would ever
+     *      see it. The shape survives so a reader knows a credential was in play.
+     *   3. Parameters are scrubbed one by one, split on "&" AND ";" — the legacy separator some PHP
+     *      stacks still emit (arg_separator.input) — with the separator put back where it was.
+     *
      * Rebuilt by hand rather than through http_build_query, which would percent-encode the square
      * brackets of the marker and turn "[Filtered]" into "%5BFiltered%5D" in every cockpit.
      */
     public function scrubUrl(string $url): string
     {
-        $split = explode('?', $url, 2);
+        $withoutFragment = explode('#', $url, 2);
+        $fragment = count($withoutFragment) === 2 ? '#' . $withoutFragment[1] : '';
+
+        $split = explode('?', $withoutFragment[0], 2);
+        $head = $this->scrubUserInfo($split[0]);
         if (count($split) === 1 || $split[1] === '') {
-            return $url;
+            return $head . (count($split) === 2 ? '?' : '') . $fragment;
         }
 
-        $scrubbedPairs = array_map(function (string $pair): string {
-            $kv = explode('=', $pair, 2);
-            if (count($kv) === 1) {
-                return $pair;
-            }
+        // preg_split with DELIM_CAPTURE keeps the separators, so "a=1;b=2&c=3" comes back unchanged
+        // apart from the values that had to go.
+        $parts = preg_split('/([&;])/', $split[1], -1, PREG_SPLIT_DELIM_CAPTURE) ?: [$split[1]];
+        $rebuilt = '';
+        foreach ($parts as $index => $part) {
+            $rebuilt .= $index % 2 === 1 ? $part : $this->scrubQueryPair($part);
+        }
 
-            return $this->keyIsDenied(urldecode($kv[0])) ? $kv[0] . '=' . self::FILTERED : $pair;
-        }, explode('&', $split[1]));
+        return $head . '?' . $rebuilt . $fragment;
+    }
 
-        return $split[0] . '?' . implode('&', $scrubbedPairs);
+    private function scrubQueryPair(string $pair): string
+    {
+        $kv = explode('=', $pair, 2);
+        if (count($kv) === 1) {
+            return $pair;
+        }
+
+        return $this->keyIsDenied(urldecode($kv[0])) ? $kv[0] . '=' . self::FILTERED : $pair;
+    }
+
+    /** "scheme://user:pass@host/path" keeps its shape and loses the credential. */
+    private function scrubUserInfo(string $head): string
+    {
+        return preg_replace(
+            '~^([A-Za-z][A-Za-z0-9+.-]*://)([^/@]+)@~',
+            '$1' . self::FILTERED . '@',
+            $head
+        ) ?? $head;
     }
 
     /**

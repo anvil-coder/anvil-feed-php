@@ -18,6 +18,13 @@ namespace AnvilFeed;
  */
 final class EventFactory
 {
+    /**
+     * The single source of sdk.version. It is what tells support which SDK a customer is running, so it
+     * must not exist twice: Task 11's release check pins THIS constant against the released tag, and the
+     * constructor default below is the only other place it is spelled.
+     */
+    public const SDK_VERSION = '0.1.0';
+
     public const MESSAGE_TYPE = 'AnvilFeed.Message';
     public const TEST_TYPE = 'AnvilFeed.TestEvent';
     public const TEST_MESSAGE = 'This event was produced by captureTestEvent() to verify the integration. '
@@ -40,7 +47,7 @@ final class EventFactory
         private readonly Scrubber $scrubber,
         private readonly GitContext $git,
         private readonly string $sdkName = 'anvil-feed-php',
-        private readonly string $sdkVersion = '0.1.0',
+        private readonly string $sdkVersion = self::SDK_VERSION,
         private readonly string $language = 'php',
     ) {
     }
@@ -72,7 +79,7 @@ final class EventFactory
         );
 
         return $this->build(
-            title: $this->clip($message, self::MAX_TITLE_CHARS),
+            title: $message,
             level: $level,
             exception: $this->exception(self::MESSAGE_TYPE, $message, $frames),
             context: $context,
@@ -121,14 +128,13 @@ final class EventFactory
             $payload['release'] = $release;
         }
         if (isset($context['request']) && is_array($context['request']) && $context['request'] !== []) {
-            // schema 1.0 requires http(s) here. A URL of any other scheme is dropped rather than sent: the
-            // documented intent is that the event survives without it, and a file:// path is somebody's
-            // local filesystem, which the ingest never asked for.
+            // The URL goes in as it came. It is scrubbed (userinfo and parameters) by Scrubber::scrubUrl
+            // and only THEN checked for an http(s) scheme, in dropUnsendable() — FR-5 e before the shape
+            // rule, so a credential can never survive on the grounds that the URL was going to be dropped.
             $url = $context['request']['url'] ?? null;
-            $isWebUrl = is_string($url) && preg_match('~^https?://~i', $url) === 1;
             $payload['request'] = array_filter([
                 'method' => $context['request']['method'] ?? null,
-                'url' => $isWebUrl ? $this->clip($url, self::MAX_SHORT_TEXT_CHARS) : null,
+                'url' => is_string($url) ? $url : null,
                 'status_code' => isset($context['request']['status_code'])
                     ? (int) $context['request']['status_code'] : null,
             ], static fn ($v) => $v !== null);
@@ -138,10 +144,7 @@ final class EventFactory
         }
         if (!empty($context['breadcrumbs']) && is_array($context['breadcrumbs'])) {
             $crumbs = array_map(
-                fn ($crumb) => $this->clip(
-                    is_string($crumb) ? $crumb : (string) json_encode($crumb),
-                    self::MAX_SHORT_TEXT_CHARS
-                ),
+                static fn ($crumb) => is_string($crumb) ? $crumb : (string) json_encode($crumb),
                 array_values($context['breadcrumbs'])
             );
             // The TAIL: it explains the fault. The ingest keeps the last MAX_BREADCRUMBS and so do we.
@@ -153,10 +156,9 @@ final class EventFactory
                 if (count($tags) >= self::MAX_TAGS) {
                     break;
                 }
-                $tags[(string) $key] = $this->clip(
-                    is_scalar($value) ? (string) $value : (string) json_encode($value),
-                    self::MAX_SHORT_TEXT_CHARS
-                );
+                $tags[(string) $key] = is_scalar($value)
+                    ? (string) $value
+                    : (string) json_encode($value);
             }
             $payload['tags'] = $tags;
         }
@@ -168,7 +170,90 @@ final class EventFactory
             ], static fn ($v) => $v !== null);
         }
 
-        return new Event($id, Event::inCanonicalOrder($this->scrubber->scrub($payload)));
+        // The order is the whole point of these three lines and it is the SERVER's order
+        // (IncidentRedaction.redact: redact, then truncate to the cap):
+        //   1. scrub   — the only step that may GROW a value, [Filtered] being ten characters
+        //   2. bound   — every cap applied to what scrubbing actually produced
+        //   3. drop    — the members the contract refuses, and then the maps they leave empty
+        $payload = $this->dropUnsendable($this->boundTexts($this->scrubber->scrub($payload)));
+
+        return new Event($id, Event::inCanonicalOrder($payload));
+    }
+
+    /**
+     * Every bound schema 1.0 states, applied AFTER scrubbing. Clipping first and redacting second is how a
+     * capped value climbs back over its cap: the defaults capture a 1000-character context window, and one
+     * "$password = 'x';" in it becomes "$password = '[Filtered]';" — fourteen characters longer, and the
+     * event is refused. That needs no unusual input; an ordinary Laravel config file does it.
+     *
+     * @param array<string, mixed> $payload
+     * @return array<string, mixed>
+     */
+    private function boundTexts(array $payload): array
+    {
+        if (isset($payload['title']) && is_string($payload['title'])) {
+            $payload['title'] = $this->clip($payload['title'], self::MAX_TITLE_CHARS);
+        }
+        if (isset($payload['service']) && is_string($payload['service'])) {
+            $payload['service'] = $this->clip($payload['service'], Config::MAX_SERVICE_CHARS);
+        }
+        if (isset($payload['exception']['message']) && is_string($payload['exception']['message'])) {
+            $payload['exception']['message'] =
+                $this->clip($payload['exception']['message'], self::MAX_MESSAGE_CHARS);
+        }
+        if (isset($payload['exception']['stacktrace']) && is_array($payload['exception']['stacktrace'])) {
+            foreach ($payload['exception']['stacktrace'] as $index => $frame) {
+                if (isset($frame['context_code']) && is_string($frame['context_code'])) {
+                    $payload['exception']['stacktrace'][$index]['context_code'] =
+                        $this->clip($frame['context_code'], self::MAX_SHORT_TEXT_CHARS);
+                }
+            }
+        }
+        if (isset($payload['request']['url']) && is_string($payload['request']['url'])) {
+            $payload['request']['url'] = $this->clip($payload['request']['url'], self::MAX_SHORT_TEXT_CHARS);
+        }
+        foreach (['breadcrumbs', 'tags'] as $block) {
+            if (!isset($payload[$block]) || !is_array($payload[$block])) {
+                continue;
+            }
+            foreach ($payload[$block] as $key => $value) {
+                if (is_string($value)) {
+                    $payload[$block][$key] = $this->clip($value, self::MAX_SHORT_TEXT_CHARS);
+                }
+            }
+        }
+
+        return $payload;
+    }
+
+    /**
+     * What the contract refuses, and what is left when everything inside a block was refused.
+     *
+     * The second half is the part that is easy to miss: PHP's empty array is JSON's `[]`, and every one of
+     * these blocks is typed `object` in schema 1.0. A request context carrying only a file:// URL, or tags
+     * carrying only the ingest's own user.ip_hash, leaves an empty array behind and the whole event is
+     * refused for a field the sender never needed to send.
+     *
+     * @param array<string, mixed> $payload
+     * @return array<string, mixed>
+     */
+    private function dropUnsendable(array $payload): array
+    {
+        // schema 1.0 requires http(s). A file:// path is somebody's local filesystem and the ingest never
+        // asked for it; the documented intent is that the event survives without the URL.
+        if (isset($payload['request']['url'])
+            && (!is_string($payload['request']['url'])
+                || preg_match('~^https?://~i', $payload['request']['url']) !== 1)) {
+            unset($payload['request']['url']);
+        }
+
+        foreach (['request', 'user', 'tags', 'agent_context', 'enrichment', 'sdk'] as $block) {
+            if (isset($payload[$block]) && $payload[$block] === []) {
+                unset($payload[$block]);
+            }
+        }
+
+        return $payload;
     }
 
     /**
@@ -179,7 +264,7 @@ final class EventFactory
     {
         $exception = ['type' => $type];
         if ($message !== '') {
-            $exception['message'] = $this->clip($message, self::MAX_MESSAGE_CHARS);
+            $exception['message'] = $message;   // bounded after scrubbing, in boundTexts()
         }
         if ($frames !== []) {
             $exception['stacktrace'] = $frames;
@@ -214,7 +299,7 @@ final class EventFactory
     private function frame(string $file, int $line, string $function): array
     {
         $frame = ['file' => $file, 'line' => max(0, $line), 'function' => $function];
-        $frame['in_app'] = $file !== '' && !str_contains($file, '/vendor/');
+        $frame['in_app'] = self::isInApp($file);
         $context = $this->contextCode($file, $line);
         if ($context !== null) {
             $frame['context_code'] = $context;
@@ -224,9 +309,10 @@ final class EventFactory
     }
 
     /**
-     * The lines around the failure, bounded exactly as the ingest bounds them — and then bounded once more
-     * as a whole, because context_lines * max_context_line_chars is 8000 at the defaults while both the
-     * ingest and schema 1.0 stop at 1000 short-text characters.
+     * The lines around the failure, each cut to the max_context_line_chars knob. The whole-value bound is
+     * NOT applied here: scrubbing grows text — "$password = 'x';" becomes "$password = '[Filtered]';" —
+     * so a window capped before redaction climbs back over the cap afterwards. boundTexts() does it in the
+     * server's order instead: redact, then truncate (IncidentRedaction.redact).
      */
     private function contextCode(string $file, int $line): ?string
     {
@@ -241,20 +327,32 @@ final class EventFactory
         }
         $slice = array_slice($lines, max(0, $line - 1 - $around), $this->config->contextLines);
 
-        return mb_substr(implode("\n", array_map(
+        return implode("\n", array_map(
             fn (string $l) => mb_substr($l, 0, $this->config->maxContextLineChars),
             $slice
-        )), 0, self::MAX_SHORT_TEXT_CHARS);
+        ));
     }
 
     private function title(string $type, string $message): string
     {
-        return $this->clip($message === '' ? $type : $type . ': ' . $message, self::MAX_TITLE_CHARS);
+        return $message === '' ? $type : $type . ': ' . $message;
     }
 
     private function clip(string $value, int $max): string
     {
         return mb_strlen($value) <= $max ? $value : mb_substr($value, 0, $max - 12) . ' [truncated]';
+    }
+
+    /**
+     * A path rule, not a substring. `str_contains($file, '/vendor/')` marks every vendor frame in_app on
+     * Windows, where __FILE__ uses backslashes — and in_app is what IncidentFingerprint.topFrames
+     * partitions on, so the same fault would fingerprint differently on a developer machine than in
+     * production and open a second incident for it. Public because it is a rule worth testing directly and
+     * the Laravel adapter needs the same answer.
+     */
+    public static function isInApp(string $file): bool
+    {
+        return $file !== '' && preg_match('~[\\\\/]vendor[\\\\/]~', $file) !== 1;
     }
 
     /** A canonical UUID v4. The ingest refuses anything else, however reasonable it looks. */

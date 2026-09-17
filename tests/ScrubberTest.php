@@ -28,14 +28,24 @@ final class ScrubberTest extends TestCase
         self::assertSame($expected, $this->scrubber()->scrub($raw));
     }
 
+    /**
+     * Stated as "the address is gone", not as an exact-array equality. The equality used to read
+     * `['user' => ['id' => 'u-1'], 'tags' => []]`, which quietly made an empty `tags` map — a shape schema
+     * 1.0 refuses — part of what this guard promised. The emptiness is EventFactory's to drop (its own
+     * test does that); what belongs here is that no address of any kind survives.
+     */
     public function testNeverLeavesAnAddressBehind(): void
     {
         $scrubbed = $this->scrubber()->scrub([
             'user' => ['id' => 'u-1', 'ip' => '203.0.113.9', 'ip_hash' => 'deadbeef'],
-            'tags' => ['user.ip_hash' => 'deadbeef'],
+            'tags' => ['user.ip_hash' => 'deadbeef', 'tenant' => 'kunde-x'],
         ]);
 
-        self::assertSame(['user' => ['id' => 'u-1'], 'tags' => []], $scrubbed);
+        self::assertSame(['id' => 'u-1'], $scrubbed['user']);
+        self::assertArrayNotHasKey('user.ip_hash', $scrubbed['tags']);
+        self::assertSame(['tenant' => 'kunde-x'], $scrubbed['tags']);
+        self::assertStringNotContainsString('203.0.113.9', json_encode($scrubbed, JSON_THROW_ON_ERROR));
+        self::assertStringNotContainsString('deadbeef', json_encode($scrubbed, JSON_THROW_ON_ERROR));
     }
 
     public function testKeepsTheBearerSchemeSoAReaderKnowsWhatWasThere(): void
@@ -51,6 +61,59 @@ final class ScrubberTest extends TestCase
         self::assertSame(
             'https://app.example/reset?token=[Filtered]&user=7',
             $this->scrubber()->scrubUrl('https://app.example/reset?token=abc123&user=7')
+        );
+    }
+
+    /**
+     * FR-5 e. A credential in the userinfo position has no key at all, so neither the parameter walk here
+     * nor IncidentRedaction's KV_SECRET on the server would ever see it. The shape survives so a reader
+     * knows a credential was in play.
+     */
+    public function testUrlCredentialsNeverTravel(): void
+    {
+        self::assertSame(
+            'https://[Filtered]@internal.example/api',
+            $this->scrubber()->scrubUrl('https://admin:hunter2@internal.example/api')
+        );
+        self::assertSame(
+            'https://[Filtered]@internal.example/api?token=[Filtered]',
+            $this->scrubber()->scrubUrl('https://admin:hunter2@internal.example/api?token=abc')
+        );
+    }
+
+    /** ";" is the legacy query separator some PHP stacks still emit (arg_separator.input). */
+    public function testTheLegacySemicolonSeparatorIsScrubbedToo(): void
+    {
+        self::assertSame(
+            'https://a.example/x?a=1;token=[Filtered];b=2',
+            $this->scrubber()->scrubUrl('https://a.example/x?a=1;token=abc;b=2')
+        );
+    }
+
+    /**
+     * The scrubbed URL has to be the sent URL minus its secrets — that is what a reader of the cockpit
+     * assumes. Folding the fragment into the last parameter's value silently ate it.
+     */
+    public function testTheFragmentSurvivesTheLastScrubbedParameter(): void
+    {
+        self::assertSame(
+            'https://app.example/reset?token=[Filtered]#section-2',
+            $this->scrubber()->scrubUrl('https://app.example/reset?token=abc123#section-2')
+        );
+        self::assertSame(
+            'https://app.example/reset#section-2',
+            $this->scrubber()->scrubUrl('https://app.example/reset#section-2')
+        );
+    }
+
+    /** FR-2 b: a denylist a customer wrote by hand may hold anything, and none of it may raise. */
+    public function testANonStringDenylistEntryIsIgnoredRatherThanCast(): void
+    {
+        $scrubber = new Scrubber(['token', ['nested'], 42, null, '  ', 'iban']);
+
+        self::assertSame(
+            ['token' => '[Filtered]', 'iban' => '[Filtered]', 'tenant' => 'kunde-x'],
+            $scrubber->scrub(['token' => 'abc', 'iban' => 'CH93', 'tenant' => 'kunde-x'])
         );
     }
 
