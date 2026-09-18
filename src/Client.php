@@ -23,6 +23,16 @@ final class Client
     private $beforeSend = null;
     private bool $shutdownRegistered = false;
     private bool $beforeSendFailureSaid = false;
+    private bool $beforeSendReadOnlySaid = false;
+    private bool $beforeSendUnsendableSaid = false;
+
+    /** Top-level members a `beforeSend` hook may read but not move. See withReadOnlyFieldsRestored(). */
+    private const READ_ONLY = ['schema_version', 'event_id', 'timestamp', 'sdk', 'service', 'environment',
+        'title'];
+
+    /** What schema 1.0 requires of every event, checked again after a hook has been over it. */
+    private const REQUIRED = ['schema_version', 'event_id', 'timestamp', 'title', 'level', 'environment',
+        'service', 'language'];
 
     public function __construct(
         private readonly Config $config,
@@ -35,11 +45,17 @@ final class Client
     ) {
     }
 
+    /**
+     * @param null|callable(): float $clock seconds; the gate and the sender share it. Injectable so a
+     *        host's own test suite can drive a window without sleeping, and so a host with a monotonic
+     *        clock of its own can hand it over.
+     */
     public static function create(
         Config $config,
         ?Transport $transport = null,
         ?Logger $logger = null,
         ?GitContext $git = null,
+        ?callable $clock = null,
     ): self {
         $logger ??= new Logger();
         $git ??= GitContext::discover(getcwd() ?: __DIR__);
@@ -50,8 +66,8 @@ final class Client
             $config,
             new EventFactory($config, $scrubber, $git),
             $queue,
-            new Sender($config, $queue, $transport ?? new DirectTransport($config), $logger),
-            new RateGate($config->fingerprintCap, $config->fingerprintWindowMs),
+            new Sender($config, $queue, $transport ?? new DirectTransport($config), $logger, $clock),
+            new RateGate($config->fingerprintCap, $config->fingerprintWindowMs, $clock),
             new LoopGuard($config->ignoredRequestPaths),
             $logger
         );
@@ -74,13 +90,32 @@ final class Client
      */
     public function captureMessage(string $message, string $level = 'warning', array $context = []): ?string
     {
-        return $this->capture(fn (): Event => $this->factory->fromMessage($message, $level, $context), $context);
+        $caller = $this->callerTrace();
+
+        return $this->capture(
+            fn (): Event => $this->factory->fromMessage($message, $level, $context, $caller),
+            $context
+        );
     }
 
     /** FR-8 a: the explicit verification call an integration guide ends with. */
     public function captureTestEvent(): ?string
     {
-        return $this->capture(fn (): Event => $this->factory->testEvent(), []);
+        $caller = $this->callerTrace();
+
+        return $this->capture(fn (): Event => $this->factory->testEvent($caller), []);
+    }
+
+    /**
+     * Taken HERE, at the public entry point, and not inside the factory. A backtrace taken further down
+     * carries however many SDK frames the call chain happens to have that week — a number that changes
+     * whenever this class is refactored, and one no test of the factory alone would notice changing.
+     *
+     * @return list<array<string, mixed>>
+     */
+    private function callerTrace(): array
+    {
+        return array_values(debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, $this->config->maxFrames + 8));
     }
 
     /**
@@ -209,14 +244,103 @@ final class Client
 
             return $payload;
         }
-        if ($modified === null) {
-            return null;   // the documented way to drop an event
-        }
-        if (!is_array($modified) || $modified === []) {
-            return null;
+        if ($modified === null || !is_array($modified) || $modified === []) {
+            return null;   // null is the documented drop; anything unusable is treated as one
         }
 
-        return Event::inCanonicalOrder($modified);
+        // The hook edits a VIEW, not the event. Everything below is put back, and then the whole thing
+        // goes through the factory's own scrub → bound → prune pipeline a second time.
+        $modified = $this->withReadOnlyFieldsRestored($modified, $payload);
+        $modified = Event::inCanonicalOrder($this->factory->finalise($modified));
+
+        return $this->isSendable($modified) ? $modified : null;
+    }
+
+    /**
+     * The fields a hook may not move, and why each one is on the list.
+     *
+     * `event_id` keys the delivery: Sender matches the ingest's verdicts on the Event's id, and a body
+     * naming a different one is retried once and then dropped with a log line blaming the network. It is
+     * also the id captureTestEvent() hands back for the operator to search for.
+     * `timestamp`, `sdk`, `service`, `environment` are the SDK's own statement about itself and about the
+     * binding the ingest resolves — a hook rewriting `service` would post a customer's events into
+     * another project's incident stream.
+     * `title`, `exception.type` and `exception.stacktrace` are the FINGERPRINT inputs: the local cap has
+     * already been charged against the identity computed from them, so a hook that changed them would
+     * cap one group and send another.
+     *
+     * @param array<string, mixed> $modified
+     * @param array<string, mixed> $original
+     * @return array<string, mixed>
+     */
+    private function withReadOnlyFieldsRestored(array $modified, array $original): array
+    {
+        $refused = [];
+        foreach (self::READ_ONLY as $key) {
+            $ours = $original[$key] ?? null;
+            if (($modified[$key] ?? null) !== $ours) {
+                $refused[] = $key;
+            }
+            if ($ours === null) {
+                unset($modified[$key]);
+            } else {
+                $modified[$key] = $ours;
+            }
+        }
+        foreach (['type', 'stacktrace'] as $member) {
+            $ours = $original['exception'][$member] ?? null;
+            if ((($modified['exception'] ?? [])[$member] ?? null) !== $ours) {
+                $refused[] = 'exception.' . $member;
+            }
+            if (!is_array($modified['exception'] ?? null)) {
+                $modified['exception'] = $original['exception'] ?? [];
+                break;
+            }
+            if ($ours === null) {
+                unset($modified['exception'][$member]);
+            } else {
+                $modified['exception'][$member] = $ours;
+            }
+        }
+
+        if ($refused !== [] && !$this->beforeSendReadOnlySaid) {
+            $this->beforeSendReadOnlySaid = true;
+            $this->logger->warning('anvil-feed: beforeSend changed ' . implode(', ', $refused)
+                . ', which this SDK owns; the change was ignored and this is said once.');
+        }
+
+        return $modified;
+    }
+
+    /**
+     * What the ingest requires, checked on the hook's output only. An event this SDK built correctly and
+     * host code then broke must not be posted for the ingest to answer 400 schema_violation about, with
+     * nothing in the log naming the cause.
+     *
+     * @param array<string, mixed> $payload
+     */
+    private function isSendable(array $payload): bool
+    {
+        $missing = [];
+        foreach (self::REQUIRED as $key) {
+            if (($payload[$key] ?? null) === null || $payload[$key] === '') {
+                $missing[] = $key;
+            }
+        }
+        if (($payload['exception']['type'] ?? null) === null) {
+            $missing[] = 'exception.type';
+        }
+        if ($missing === []) {
+            return true;
+        }
+        if (!$this->beforeSendUnsendableSaid) {
+            $this->beforeSendUnsendableSaid = true;
+            $this->logger->warning('anvil-feed: beforeSend returned an event without '
+                . implode(', ', $missing) . '; the ingest would refuse it, so it was dropped here. '
+                . 'This is said once.');
+        }
+
+        return false;
     }
 
     /** One log line per window per fingerprint — the storm itself must not become the log flood. */

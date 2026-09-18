@@ -133,13 +133,114 @@ final class LoopGuardTest extends TestCase
             $gate->allow('fingerprint-' . $i);
         }
 
-        // The most recent is still tracked and capped; the oldest was evicted rather than remembered.
-        self::assertFalse($gate->allow('fingerprint-4999'));
-        self::assertTrue($gate->allow('fingerprint-0'), 'the oldest was evicted, not kept for ever');
-
         $windows = (new \ReflectionProperty(RateGate::class, 'windows'))->getValue($gate);
         self::assertLessThanOrEqual(500, count($windows),
             '5000 distinct faults must not leave 5000 rows behind');
+    }
+
+    /**
+     * The defect this class exists to prevent, in the shape that defeated the first version: a storm plus
+     * churn. The loud fingerprint was tracked first, so under "evict the oldest entry" it was the FIRST
+     * one thrown out — the gate evicted precisely what it was capping, and the storm walked back through
+     * with a fresh count. Nothing in the log said so.
+     *
+     * Every distinct fingerprint here is live (the clock is frozen), so the table fills with nothing
+     * expired, which is exactly the case the shared overflow bucket answers.
+     */
+    public function testAStormingFingerprintIsNotEvictedByAChurnOfDistinctOnes(): void
+    {
+        $now = 1000.0;
+        $gate = new RateGate(2, 60000, function () use (&$now) { return $now; });
+
+        self::assertTrue($gate->allow('HOT'));
+        self::assertTrue($gate->allow('HOT'));
+        self::assertFalse($gate->allow('HOT'), 'capped, as it must be');
+
+        for ($i = 0; $i < 2000; $i++) {   // four times the table, all of them live
+            $gate->allow('cold-' . $i);
+        }
+
+        self::assertFalse($gate->allow('HOT'), 'the cap survived the churn — nothing evicted a live entry');
+        self::assertGreaterThan(0, $gate->suppressed('HOT'));
+    }
+
+    /**
+     * And the newcomers there was no room to track are capped too, against a shared window. Letting one
+     * through because the table is full would be an uncapped storm on the one path that exists to cap
+     * storms.
+     */
+    public function testAFingerprintTheTableHasNoRoomForIsStillCapped(): void
+    {
+        $now = 1000.0;
+        $gate = new RateGate(3, 60000, function () use (&$now) { return $now; });
+        for ($i = 0; $i < 600; $i++) {
+            $gate->allow('live-' . $i);
+        }
+
+        $allowed = 0;
+        for ($i = 0; $i < 50; $i++) {
+            $allowed += $gate->allow('newcomer-' . $i) ? 1 : 0;
+        }
+
+        self::assertLessThanOrEqual(3, $allowed, 'the overflow bucket caps them together');
+        self::assertGreaterThan(0, $gate->suppressed('newcomer-49'),
+            'and the drop is countable, so the storm can still be said once');
+    }
+
+    /** An expired entry is capping nothing, so it is the one that makes room — and the table stays bounded. */
+    public function testAnExpiredEntryIsTheOneThatMakesRoom(): void
+    {
+        $now = 1000.0;
+        $gate = new RateGate(1, 60000, function () use (&$now) { return $now; });
+        for ($i = 0; $i < 500; $i++) {
+            $gate->allow('old-' . $i);
+        }
+
+        $now += 61.0;   // every tracked window has expired
+        self::assertTrue($gate->allow('fresh'));
+
+        $windows = (new \ReflectionProperty(RateGate::class, 'windows'))->getValue($gate);
+        self::assertArrayHasKey('fresh', $windows, 'a fresh fingerprint is tracked apart, not overflowed');
+        self::assertLessThanOrEqual(500, count($windows));
+    }
+
+    /**
+     * A clock that steps backwards (NTP, `date -s`) must not hold a window open for the size of the step.
+     * The gate's own default clock is monotonic; this is the guard for an injected one that is not.
+     */
+    public function testAClockThatStepsBackwardsDoesNotMuteAFingerprintForEver(): void
+    {
+        $now = 1000.0;
+        $gate = new RateGate(1, 60000, function () use (&$now) { return $now; });
+
+        self::assertTrue($gate->allow('f'));
+        self::assertFalse($gate->allow('f'));
+
+        $now -= 3600.0;   // the clock jumped an hour into the past
+        self::assertTrue($gate->allow('f'), 'a backwards step opens a new window rather than freezing one');
+    }
+
+    /** Finding 6: every shape a rewrite rule or a permissive router can put in front of the guard. */
+    public function testMatchingIsCaseInsensitiveAndResolvesDotSegments(): void
+    {
+        $guard = new LoopGuard(['/api/feed/**']);
+
+        self::assertTrue($guard->ignoresPath('/API/FEED/events'));
+        self::assertTrue($guard->ignoresPath('/app/../api/feed/events'));
+        self::assertTrue($guard->ignoresPath('//api/feed//events'));
+        self::assertTrue($guard->ignoresPath('/api/feed/./events'));
+        self::assertTrue($guard->ignoresPath('/api/feed/'));
+        self::assertTrue($guard->ignoresPath('https://app.anvil-coder.tech/API/Feed/events'));
+        self::assertFalse($guard->ignoresPath('/api/feedback'), 'and still no overshoot');
+    }
+
+    /** A pattern written in mixed case by an operator has to work too, not only a mixed-case request. */
+    public function testAPatternWrittenInMixedCaseMatches(): void
+    {
+        $guard = new LoopGuard(['/Internal/Health']);
+
+        self::assertTrue($guard->ignoresPath('/internal/health'));
+        self::assertTrue($guard->ignoresPath('/INTERNAL/HEALTH'));
     }
 
     /**

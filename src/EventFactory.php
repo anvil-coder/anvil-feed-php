@@ -67,37 +67,75 @@ final class EventFactory
         );
     }
 
-    /** @param array<string, mixed> $context */
-    public function fromMessage(string $message, string $level = 'warning', array $context = []): Event
-    {
-        $backtrace = debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, $this->config->maxFrames + 4);
-        $frames = $this->framesOf(
-            array_slice($backtrace, 1),
-            $backtrace[0]['file'] ?? 'unknown',
-            $backtrace[0]['line'] ?? 0,
-            null
-        );
-
+    /**
+     * @param array<string, mixed> $context
+     * @param list<array<string, mixed>>|null $callerTrace the backtrace taken at the PUBLIC entry point
+     */
+    public function fromMessage(
+        string $message,
+        string $level = 'warning',
+        array $context = [],
+        ?array $callerTrace = null,
+    ): Event {
         return $this->build(
             title: $message,
             level: $level,
-            exception: $this->exception(self::MESSAGE_TYPE, $message, $frames),
+            exception: $this->exception(self::MESSAGE_TYPE, $message, $this->callerFrames($callerTrace)),
             context: $context,
         );
     }
 
-    public function testEvent(): Event
+    /** @param list<array<string, mixed>>|null $callerTrace */
+    public function testEvent(?array $callerTrace = null): Event
     {
         return $this->build(
             title: 'Anvil Feed test event',
             level: 'error',
-            exception: $this->exception(self::TEST_TYPE, self::TEST_MESSAGE, [[
-                'file' => __FILE__,
-                'line' => __LINE__,
-                'function' => 'testEvent',
-                'in_app' => false,
-            ]]),
+            exception: $this->exception(self::TEST_TYPE, self::TEST_MESSAGE, $this->callerFrames($callerTrace)),
             context: [],
+        );
+    }
+
+    /**
+     * The stack of whoever called us, with this SDK's own frames removed from the front.
+     *
+     * A synthesised exception whose stack starts inside anvil-feed is worse than useless twice over. The
+     * operator opens an incident and reads three of OUR files before their own; and — the expensive half —
+     * `isInApp()` decides the in-app promotion the fingerprint partitions on, so wherever this package is
+     * NOT installed under a `vendor/` directory (a Composer `path` repository, a monorepo checkout, the
+     * in-repo adapter) those three constant frames would win the promotion and EVERY captureMessage() in
+     * the application would collapse into one fingerprint — the exact failure the promotion exists to
+     * prevent, turned inward. So the frames are dropped by path, and `isInApp()` refuses this directory
+     * as well, which makes the two defences independent.
+     *
+     * @param list<array<string, mixed>>|null $callerTrace
+     * @return list<array<string, mixed>>
+     */
+    private function callerFrames(?array $callerTrace): array
+    {
+        $trace = $callerTrace ?? debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, $this->config->maxFrames + 8);
+        $trace = array_values($trace);
+
+        $first = null;
+        foreach ($trace as $index => $entry) {
+            $file = is_string($entry['file'] ?? null) ? $entry['file'] : '';
+            if ($file !== '' && !self::isOurOwn($file)) {
+                $first = $index;
+                break;
+            }
+        }
+        if ($first === null) {
+            // Nothing outside this SDK called us — there is no caller stack to report, and inventing one
+            // out of our own files is the defect above. The event then groups by its title, which is the
+            // documented shape for an event without frames.
+            return [];
+        }
+
+        return $this->framesOf(
+            array_slice($trace, $first + 1),
+            (string) $trace[$first]['file'],
+            (int) ($trace[$first]['line'] ?? 0),
+            null
         );
     }
 
@@ -175,9 +213,24 @@ final class EventFactory
         //   1. scrub   — the only step that may GROW a value, [Filtered] being ten characters
         //   2. bound   — every cap applied to what scrubbing actually produced
         //   3. drop    — the members the contract refuses, and then the maps they leave empty
-        $payload = $this->dropUnsendable($this->boundTexts($this->scrubber->scrub($payload)));
+        return new Event($id, Event::inCanonicalOrder($this->finalise($payload)));
+    }
 
-        return new Event($id, Event::inCanonicalOrder($payload));
+    /**
+     * Scrub, bound, prune — the three steps in the server's own order, as ONE callable step.
+     *
+     * It is public because a `beforeSend` hook's output has to go through exactly the same pipeline as the
+     * payload this factory built: FR-5 says the SDK redacts before sending, and the most obvious use of
+     * the hook is enrichment ($payload['tags']['user_email'] = …), which would otherwise reach the wire
+     * having never met the denylist. `Scrubber::scrub` is idempotent, so a second pass over an already
+     * scrubbed payload costs one walk and cannot double-filter.
+     *
+     * @param array<string, mixed> $payload
+     * @return array<string, mixed>
+     */
+    public function finalise(array $payload): array
+    {
+        return $this->dropUnsendable($this->boundTexts($this->scrubber->scrub($payload)));
     }
 
     /**
@@ -352,7 +405,24 @@ final class EventFactory
      */
     public static function isInApp(string $file): bool
     {
-        return $file !== '' && preg_match('~[\\\\/]vendor[\\\\/]~', $file) !== 1;
+        if ($file === '' || self::isOurOwn($file)) {
+            return false;   // this SDK is never the customer's own code, wherever it is installed
+        }
+
+        return preg_match('~[\\\\/]vendor[\\\\/]~', $file) !== 1;
+    }
+
+    /**
+     * A file inside this package. `__DIR__` rather than a `vendor/` substring, because the one install
+     * layout where the substring rule fails — the SDK NOT under vendor/ — is the layout every developer
+     * of this repository and of the Laravel adapter runs.
+     */
+    private static function isOurOwn(string $file): bool
+    {
+        $normalized = str_replace('\\', '/', $file);
+        $ours = str_replace('\\', '/', __DIR__) . '/';
+
+        return str_starts_with($normalized, $ours);
     }
 
     /** A canonical UUID v4. The ingest refuses anything else, however reasonable it looks. */

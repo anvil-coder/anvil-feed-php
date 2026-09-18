@@ -324,6 +324,211 @@ final class ClientTest extends TestCase
         self::assertSame(0, $client->queue()->count());
     }
 
+    // ------------------------------------------------ the caller's stack (review finding 1)
+
+    /**
+     * A message event's stack must be the CALLER's. When it was the SDK's own, the three constant frames
+     * `Client.php#{main}`, `Client.php#{closure}`, `Client.php#capture` led every stack — and wherever
+     * this package is not installed under a `vendor/` directory they are `in_app`, win the promotion, and
+     * every captureMessage() in the application collapses into ONE fingerprint. The local cap then mutes
+     * the whole message stream of the process after ten events.
+     */
+    public function testAMessageEventCarriesTheCallersFramesAndNoneOfOurs(): void
+    {
+        $client = $this->client();
+        $client->captureMessage('Payment reconciliation skipped for 3 accounts', 'warning');
+        $frames = $client->queue()->take(1)[0]->payload['exception']['stacktrace'];
+
+        self::assertNotSame([], $frames);
+        self::assertSame(__FILE__, $frames[0]['file'], 'the stack starts where the caller called');
+        $ours = dirname(__DIR__) . DIRECTORY_SEPARATOR . 'src' . DIRECTORY_SEPARATOR;
+        foreach ($frames as $frame) {
+            self::assertStringNotContainsString($ours, $frame['file'],
+                'no frame of this SDK may appear in a customer-facing stack: ' . $frame['file']);
+        }
+    }
+
+    /**
+     * The second, independent half of the same defence. Dropping the frames keeps them out of the stack;
+     * this keeps them out of the in-app PROMOTION even if one ever survives — which is what decides the
+     * fingerprint. `vendor/` is not a reliable answer here: in a Composer `path` repository, a monorepo
+     * checkout or this repository itself, the SDK is not under a `vendor/` directory at all.
+     */
+    public function testThisSdkIsNeverItsOwnInAppCodeWhereverItIsInstalled(): void
+    {
+        self::assertFalse(EventFactory::isInApp(dirname(__DIR__) . '/src/Client.php'));
+        self::assertFalse(EventFactory::isInApp(dirname(__DIR__) . '/src/Transport/DirectTransport.php'));
+        self::assertTrue(EventFactory::isInApp('/srv/app/app/Services/OrderService.php'),
+            'and the customer\'s own code is still in-app');
+    }
+
+    public function testTheTestEventCarriesTheCallersFramesToo(): void
+    {
+        $client = $this->client();
+        $client->captureTestEvent();
+        $frames = $client->queue()->take(1)[0]->payload['exception']['stacktrace'];
+
+        self::assertSame(__FILE__, $frames[0]['file']);
+    }
+
+    /**
+     * The failure the collapse produces, stated as the rule that prevents it: two call sites, two
+     * identities. `testAMessageFromAnotherSiteIsAnotherIdentity` below is the second site — the two
+     * fingerprints are compared through a shared static because they must come from two different
+     * methods to be a real proof (the same method twice would pass even with the SDK's own frames).
+     */
+    private static ?string $fingerprintFromTheOtherSite = null;
+
+    public function testAMessageFromOneSiteHasItsOwnIdentity(): void
+    {
+        $this->recordTheFingerprintOfAMessageHere();
+    }
+
+    public function testAMessageFromAnotherSiteIsAnotherIdentity(): void
+    {
+        $first = self::$fingerprintFromTheOtherSite ?? $this->fingerprintOfAMessage();
+        $second = $this->fingerprintOfAMessage();
+
+        self::assertNotSame($first, $second,
+            'two call sites must be two incidents — otherwise the cap mutes the whole message stream');
+    }
+
+    private function recordTheFingerprintOfAMessageHere(): void
+    {
+        self::$fingerprintFromTheOtherSite = $this->fingerprintOfAMessage();
+        self::assertNotNull(self::$fingerprintFromTheOtherSite);
+    }
+
+    private function fingerprintOfAMessage(): string
+    {
+        $client = $this->client();
+        $client->captureMessage('the very same text from both sites', 'error');
+
+        return Fingerprint::ofEvent($client->queue()->take(1)[0]->payload);
+    }
+
+    // --------------------------------- the beforeSend view (review findings 3 and 4)
+
+    /**
+     * FR-5: the SDK redacts before sending. The most obvious use of the hook is enrichment, and a value
+     * a hook adds has never met the denylist — so the hook's output goes through the SAME
+     * scrub → bound → prune pipeline as everything else.
+     */
+    public function testWhatABeforeSendHookAddsIsScrubbedLikeEverythingElse(): void
+    {
+        // context_lines => 0 for the reason Task 1's scrubber test gives: with context code on, the frame
+        // quotes THIS file, and the literal below comes back as source rather than as a scrubbed field.
+        $client = $this->client(['context_lines' => 0]);
+        $client->beforeSend(static function (array $payload): array {
+            $payload['tags'] = ['password' => 'hunter2', 'tenant' => 'acme'];
+            $payload['breadcrumbs'] = ['api_key=sk_live_4242424242'];
+
+            return $payload;
+        });
+        $client->captureException(new \RuntimeException('boom'));
+        $payload = $client->queue()->take(1)[0]->payload;
+
+        self::assertSame('[Filtered]', $payload['tags']['password']);
+        self::assertSame('acme', $payload['tags']['tenant'], 'and nothing else was swept away');
+        self::assertStringNotContainsString('sk_live_4242424242', json_encode($payload));
+    }
+
+    /**
+     * The delivery key. `Sender::applyVerdicts` matches the ingest's answer on `Event->id`; a body
+     * naming another id is never found in `accepted`, is re-sent once and then dropped with a log line
+     * blaming the network for what host code did. The id handed back to the caller is also the one
+     * `captureTestEvent()` exists to be searched for.
+     */
+    public function testAHookCannotRewriteTheFieldsThisSdkOwns(): void
+    {
+        $sink = new RecordingLogger();
+        $client = $this->client([], null, new Logger($sink));
+        $client->beforeSend(static function (array $payload): array {
+            $payload['event_id'] = '00000000-0000-4000-8000-000000000000';
+            $payload['service'] = 'somebody-elses-project';
+            $payload['environment'] = 'staging';
+            $payload['title'] = 'a different incident entirely';
+            $payload['exception']['type'] = 'NotTheRealType';
+            $payload['user'] = ['id' => 'u-1'];   // …while an ordinary addition still works
+
+            return $payload;
+        });
+
+        $id = $client->captureException(new \RuntimeException('boom'));
+        $event = $client->queue()->take(1)[0];
+
+        self::assertSame($id, $event->id);
+        self::assertSame($id, $event->payload['event_id'], 'the body names the id the caller was given');
+        self::assertSame('disponio-api', $event->payload['service']);
+        self::assertSame('production', $event->payload['environment']);
+        self::assertSame('RuntimeException: boom', $event->payload['title']);
+        self::assertSame('RuntimeException', $event->payload['exception']['type']);
+        self::assertSame(['id' => 'u-1'], $event->payload['user']);
+        self::assertCount(1, $sink->matching('beforeSend changed'));
+    }
+
+    /** The fingerprint the cap was charged against must be the fingerprint of what is actually sent. */
+    public function testTheQueuedEventStillCarriesTheIdentityTheCapWasChargedAgainst(): void
+    {
+        $client = $this->client();
+        $client->beforeSend(static function (array $payload): array {
+            $payload['exception']['stacktrace'] = [];
+            $payload['title'] = 'rewritten';
+
+            return $payload;
+        });
+        $client->captureException(new \RuntimeException('boom'));
+        $payload = $client->queue()->take(1)[0]->payload;
+
+        self::assertNotSame([], $payload['exception']['stacktrace']);
+        self::assertSame('RuntimeException: boom', $payload['title']);
+    }
+
+    /**
+     * An event this SDK built correctly and host code then broke must not be posted for the ingest to
+     * answer `400 schema_violation` about, with nothing in the log naming the cause.
+     */
+    public function testAHookThatBreaksTheContractDropsTheEventHereRatherThanAtTheIngest(): void
+    {
+        $sink = new RecordingLogger();
+        $client = $this->client([], null, new Logger($sink));
+        $client->beforeSend(static fn (array $payload) => array_diff_key($payload, ['level' => 1]));
+
+        self::assertNull($client->captureException(new \RuntimeException('boom')));
+        self::assertSame(0, $client->queue()->count());
+        self::assertCount(1, $sink->matching('beforeSend returned an event without level'));
+    }
+
+    // ------------------------------------------------- the injected clock (finding 5)
+
+    /**
+     * The window, driven without a sleep. The gate's default clock is monotonic; this proves the seam a
+     * host's own suite (and the Laravel adapter's) uses.
+     */
+    public function testTheGatesClockCanBeInjectedThroughCreate(): void
+    {
+        $now = 1000.0;
+        $client = Client::create(
+            Config::fromArray([
+                'token' => 'anv_srv_0123456789abcdef0123456789abcdef',
+                'service' => 'disponio-api',
+                'fingerprint_cap' => 1,
+                'fingerprint_window_ms' => 60000,
+            ], new Logger()),
+            new RecordingTransport(),
+            new Logger(),
+            GitContext::none(),
+            function () use (&$now) { return $now; }
+        );
+
+        self::assertNotNull($client->captureException(new \RuntimeException('boom')));
+        self::assertNull($client->captureException(new \RuntimeException('boom')));
+
+        $now += 61.0;
+        self::assertNotNull($client->captureException(new \RuntimeException('boom')),
+            'the window moved on because the injected clock did');
+    }
+
     /** The facade is a no-op until init(), so a library may call it in an application that never wired us. */
     public function testTheFacadeIsSilentUntilItHasAClientAndThenDelegates(): void
     {
