@@ -10,6 +10,7 @@ use AnvilFeed\Config;
 use AnvilFeed\GitContext;
 use AnvilFeed\Logger;
 use AnvilFeed\Tests\Support\RecordingLogger;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
 /**
@@ -25,12 +26,16 @@ use PHPUnit\Framework\TestCase;
  * refuses the other half of with a 400. Those exist on a socket or nowhere, and `DirectTransport` — the
  * transport every host without a PSR-18 client runs — has no seam a double could take.
  *
- * The scenario travels in the URL rather than in a header, because `DirectTransport` sends what the
- * contract says it sends and a test may not add to it. `tests/Conformance/stub-router.php` switches on it
- * and answers with the published bodies from `conformance/responses/`.
+ * Two things the stub does that make this more than a reaction test. It enforces the ingest's own
+ * REQUEST rules first, whatever the scenario says (`Origin` ⇒ 403, no bearer ⇒ 401, oversize ⇒ 413,
+ * non-JSON or a batch over 50 ⇒ 400), so every test here is also a standing check that the SDK never
+ * *earns* one of those answers. And every entry of `conformance/responses/index.json` is a scenario, so
+ * the walk below cannot fall behind the published contract.
  *
- * A run in which the server cannot be started is a FAILED run, never a skipped one: this file is the only
- * place the PHP SDK is held against a real ingest conversation.
+ * The clock is injected and frozen (`Client::create(..., clock:)`), which is what lets a pause be
+ * asserted as an exact equality rather than as a window — and lets the whole file run without a sleep.
+ *
+ * A run in which the server cannot be started is a FAILED run, never a skipped one.
  */
 final class MockServerTest extends TestCase
 {
@@ -39,6 +44,7 @@ final class MockServerTest extends TestCase
     private static string $base = '';
 
     private const TOKEN = 'anv_srv_0123456789abcdef0123456789abcdef';
+    private const RESPONSES = __DIR__ . '/../../../../conformance/responses';
 
     /** Distinct classes, so the per-fingerprint storm cap does not quietly swallow the later captures. */
     private const FAULTS = [
@@ -46,44 +52,23 @@ final class MockServerTest extends TestCase
         \OverflowException::class, \RangeException::class, \UnderflowException::class,
     ];
 
+    /** The injected clock. Frozen, so `pausedUntil()` is an exact number and nothing has to sleep. */
+    private float $now = 1_000_000.0;
+
     private string $run = '';
     private ?Client $client = null;
     private RecordingLogger $written;
 
     public static function setUpBeforeClass(): void
     {
-        $port = self::freePort();
-        $pipes = [];
-        $process = proc_open(
-            sprintf(
-                '%s -S 127.0.0.1:%d %s',
-                escapeshellarg(PHP_BINARY),
-                $port,
-                escapeshellarg(__DIR__ . '/stub-router.php')
-            ),
-            [1 => ['file', '/dev/null', 'w'], 2 => ['file', '/dev/null', 'w']],
-            $pipes,
-            null,
-            // The timeout scenario holds a worker for three seconds on purpose; a single-threaded server
-            // would turn that into a timeout for every test that ran after it.
-            ['PHP_CLI_SERVER_WORKERS' => '8'] + getenv()
-        );
-        if (!is_resource($process)) {
-            return;
-        }
-        self::$server = $process;
-
-        for ($attempt = 0; $attempt < 100; $attempt++) {
-            $probe = @fsockopen('127.0.0.1', $port, $errno, $error, 0.2);
-            if (is_resource($probe)) {
-                fclose($probe);
-                self::$base = 'http://127.0.0.1:' . $port;
-
+        // Up to three attempts: freePort() closes its probe socket before `php -S` binds, so another
+        // process can take the number in between — and a readiness probe that then succeeded against a
+        // FOREIGN server would fail these tests in a way that named nothing.
+        for ($attempt = 0; $attempt < 3; $attempt++) {
+            if (self::startServer()) {
                 return;
             }
-            usleep(50_000);
         }
-        self::stopServer();
     }
 
     public static function tearDownAfterClass(): void
@@ -108,12 +93,152 @@ final class MockServerTest extends TestCase
         @unlink($this->leakMarker());
     }
 
+    // ---------------------------------------- the whole published response index, over the socket
+
+    /**
+     * Every entry of `conformance/responses/index.json`, walked end to end. Adding a response fixture
+     * adds a socket-level case here and a parser-level case in {@see ResponseDecisionTest} at once; the
+     * commit that adds one cannot leave either runner behind.
+     *
+     * @return array<string, array{array<string, mixed>}>
+     */
+    public static function publishedResponses(): array
+    {
+        $index = json_decode((string) file_get_contents(self::RESPONSES . '/index.json'), true);
+        self::assertIsArray($index);
+        self::assertGreaterThanOrEqual(9, count($index), 'conformance/responses/index.json lost entries');
+
+        $cases = [];
+        foreach ($index as $entry) {
+            $cases[(string) $entry['file']] = [$entry];
+        }
+
+        return $cases;
+    }
+
+    /** @param array<string, mixed> $entry */
+    #[DataProvider('publishedResponses')]
+    public function testTheClientMakesTheDecisionTheIndexNamesOverARealSocket(array $entry): void
+    {
+        $published = json_decode((string) file_get_contents(self::RESPONSES . '/' . $entry['file']), true);
+        // A 202 names a verdict per event, so the batch is sized to the fixture's verdicts; anything
+        // else refuses or defers the whole request and two events are enough to show it.
+        $events = (int) $entry['status'] === 202
+            ? max(1, count($published['accepted'] ?? []) + count($published['rejected'] ?? []))
+            : 2;
+
+        $requests = $this->drive(basename((string) $entry['file'], '.json'), $events);
+
+        self::assertNotSame([], $requests, (string) $entry['file'] . ': the request never reached the stub');
+        self::assertFalse($this->client?->sender()->isStopped(),
+            (string) $entry['file'] . ': none of these is a credential failure; only a 401 stops the process');
+
+        $retryAfter = $entry['retry_after'] === null ? null : (int) $entry['retry_after'];
+        switch ($entry['retry']) {
+            case 'none':
+                self::assertSame(0, $this->queueCount(), (string) $entry['file']
+                    . ': the verdict is final — nothing of this batch may be sent again');
+                self::assertLessThanOrEqual($this->now, (float) $this->client?->sender()->pausedUntil(),
+                    (string) $entry['file'] . ': a final verdict is not a reason to stop sending anything else');
+                break;
+
+            case 'after-delay':
+            case 'whole-batch':
+                self::assertSame($events, $this->queueCount(), (string) $entry['file']
+                    . ': a retryable answer must never cost an event');
+                self::assertNotNull($retryAfter, (string) $entry['file'] . ': the index must name a delay');
+                // The exact equality is the point of the injected clock: the pause is the header's
+                // value, not a backoff of the sender's own that happens to land nearby.
+                self::assertSame($this->now + (float) $retryAfter,
+                    (float) $this->client?->sender()->pausedUntil(),
+                    (string) $entry['file'] . ': the pause is exactly Retry-After');
+                break;
+
+            default:
+                self::fail('unknown retry verdict ' . var_export($entry['retry'], true));
+        }
+
+        foreach ($this->reasonCodes($published) as $code) {
+            self::assertNotSame([], $this->written->matching($code), (string) $entry['file']
+                . ": the reason code {$code} is the whole message; an SDK that swallows it leaves the "
+                . 'customer with an empty inbox and no explanation');
+        }
+    }
+
+    /**
+     * The finding this round exists for. `Sender::apply` reads
+     * `$response->retryAfterSeconds ?? self::DEFAULT_RATE_LIMIT_PAUSE_SECONDS`, and until the index
+     * carried a window other than 60 nothing in this repository could tell the two apart: every fixture
+     * used the SDK's own fallback constant, so a regression that dropped the header was invisible.
+     *
+     * `429-rate-limited-long-window.json` asks for 137 s and `503-transient-long-window.json` for 900 s
+     * — read out of the index rather than retyped here, so a change to the published contract cannot
+     * leave this test green and wrong.
+     *
+     * @return array<string, array{string, int}>
+     */
+    public static function nonDefaultWindows(): array
+    {
+        $windows = [];
+        foreach (json_decode((string) file_get_contents(self::RESPONSES . '/index.json'), true) as $entry) {
+            // 60 and 30 are Sender::DEFAULT_RATE_LIMIT_PAUSE_SECONDS and DEFAULT_TRANSIENT_PAUSE_SECONDS.
+            if ($entry['retry_after'] !== null && !in_array((int) $entry['retry_after'], [60, 30], true)) {
+                $windows[(string) $entry['file']] = [
+                    basename((string) $entry['file'], '.json'),
+                    (int) $entry['retry_after'],
+                ];
+            }
+        }
+        self::assertGreaterThanOrEqual(2, count($windows),
+            'the index must carry at least one 429 and one 503 whose Retry-After is NOT the SDK fallback, '
+            . 'or nothing here can tell a parsed header from a hard-coded constant');
+
+        return $windows;
+    }
+
+    #[DataProvider('nonDefaultWindows')]
+    public function testThePauseIsTheHeadersValueAndNotTheSdksFallback(string $scenario, int $seconds): void
+    {
+        $this->drive($scenario, 2);
+        $waited = (float) $this->client?->sender()->pausedUntil() - $this->now;
+
+        self::assertSame((float) $seconds, $waited);
+        self::assertNotSame(60.0, $waited, 'that is the 429 fallback constant, not the header');
+        self::assertNotSame(30.0, $waited, 'that is the 503 fallback constant, not the header');
+        self::assertSame(2, $this->queueCount());
+        self::assertNotSame([], $this->written->matching('paused for ' . $seconds . 's'));
+    }
+
+    /**
+     * …and the other branch of the `??`. `docs/anvil-feed-ingest.md` sends `Retry-After` with every 429
+     * and every 503, but a proxy can strip a header, and the documented fallback has to be exactly the
+     * documented number rather than zero — which would be a hot loop against a server asking for room.
+     *
+     * @return array<string, array{string, float}>
+     */
+    public static function missingHeaderFallbacks(): array
+    {
+        return [
+            '429 without Retry-After' => ['no-retry-after-429', 60.0],
+            '503 without Retry-After' => ['no-retry-after-503', 30.0],
+        ];
+    }
+
+    #[DataProvider('missingHeaderFallbacks')]
+    public function testAMissingRetryAfterFallsBackToTheDocumentedDefault(string $scenario, float $seconds): void
+    {
+        $this->drive($scenario, 2);
+
+        self::assertSame($this->now + $seconds, (float) $this->client?->sender()->pausedUntil());
+        self::assertSame(2, $this->queueCount());
+    }
+
     // ------------------------------------------------------------------- 202
 
     /**
-     * The healthy path, and the two contract rules that only exist on the wire: ONE event goes to
-     * `/events` as a JSON object, and the credential travels as a bearer token — while no `Origin` header
-     * is ever sent, which is the very thing the ingest answers 403 to.
+     * The healthy path, and the contract rule that only exists on the wire: ONE event goes to `/events`
+     * as a JSON object. The credential, the content type, the absent `Origin` and the body size are
+     * asserted for every request of every test by {@see assertNothingTheIngestWouldRefuseWasSent}.
      */
     public function testASingleEventIsPostedAsAnObjectToEventsAndClearsTheQueue(): void
     {
@@ -124,9 +249,6 @@ final class MockServerTest extends TestCase
         self::assertSame('object', $requests[0]['shape'], 'a single event is an OBJECT; the ingest '
             . 'answers 400 to an array on this route on purpose');
         self::assertSame('POST', $requests[0]['method']);
-        self::assertSame('Bearer ' . self::TOKEN, $requests[0]['authorization']);
-        self::assertSame('', $requests[0]['origin'], 'this SDK never sends an Origin; a server token '
-            . 'presented with one is treated as leaked and answered 403');
         self::assertSame(0, $this->queueCount());
         self::assertSame([], $this->written->matching('anvil-feed: dropped'));
     }
@@ -143,36 +265,12 @@ final class MockServerTest extends TestCase
         self::assertSame(0, $this->queueCount());
     }
 
-    /**
-     * A 202 that accepts one event and refuses the other. BOTH verdicts are final — the rejected id is
-     * not retried — and the reason code has to reach the operator, because `no_binding` is the one
-     * failure that looks exactly like "everything is fine" from inside the application.
-     */
-    public function testAPartial202ClearsBothVerdictsAndNamesTheReasonCode(): void
-    {
-        $this->drive('partial', 2);
-
-        self::assertSame(0, $this->queueCount(), 'a refusing verdict still clears the event');
-        self::assertNotSame([], $this->written->matching('no_binding'));
-        self::assertNotSame([], $this->written->matching('cockpit'));
-    }
-
-    // ------------------------------------------------------------ 4xx
-
-    public function testA400DropsTheBatchSaysWhyOnceAndDoesNotRetry(): void
-    {
-        $requests = $this->drive('bad-request', 1);
-
-        self::assertCount(1, $requests, 'a 400 is never retried — the sender is the thing that is wrong');
-        self::assertSame(0, $this->queueCount());
-        self::assertNotSame([], $this->written->matching('schema_violation'));
-        self::assertNotSame([], $this->written->matching('400'));
-    }
+    // ----------------------------------------------------------- 4xx and 5xx
 
     /**
      * A 401 is the end of sending for this process. The queue is drained — a stopped sender that keeps
-     * queueing is a memory leak with a nice name — and a capture made afterwards must return null rather
-     * than pile up behind a door that will not open again.
+     * queueing is a memory leak with a nice name — and a capture made afterwards must return null
+     * rather than pile up behind a door that will not open again.
      */
     public function testA401StopsTheProcessDrainsTheQueueAndRefusesLaterCaptures(): void
     {
@@ -199,59 +297,59 @@ final class MockServerTest extends TestCase
 
     /**
      * 413: halve the batch and try the halves, down to the single event, which is dropped because there
-     * is nothing left to split. The proof is the request COUNT — a sender that dropped the batch whole
-     * would make exactly one request and pass every other assertion here.
+     * is nothing left to split. The request COUNT is the proof — a sender that dropped the batch whole
+     * would make exactly one request and pass every other assertion here — and it is asserted EXACTLY.
+     * Four events against a server that always answers 413: 4, 2, 1 (the 1 is dropped), then the two
+     * halves that were pushed back, 3, 1 and 2, 1 and 1. Eight requests, four dropped events, an empty
+     * queue. "More than one" would also pass for a sender that halved once and dropped the rest.
      */
     public function testA413HalvesTheBatchRatherThanDroppingItWhole(): void
     {
-        $requests = $this->drive('too-large', 4);
+        $requests = $this->drive('413-payload-too-large', 4);
 
-        self::assertGreaterThan(1, count($requests), 'the batch must be split, not dropped whole');
-        self::assertSame(1, count($requests[count($requests) - 1]['ids']),
+        self::assertCount(8, $requests, 'the batch is halved down to single events, not dropped whole');
+        self::assertSame(1, $requests[count($requests) - 1]['events'],
             'the split ends at a single event, which is the only thing that may be dropped for size');
         self::assertSame(0, $this->queueCount());
         self::assertNotSame([], $this->written->matching('payload_too_large'));
         self::assertNotSame([], $this->written->matching('Halving the batch'));
     }
 
-    /**
-     * 429 is the one status that must never cost an event. The pause is exactly `Retry-After` — read off
-     * the real header, which is the part no `Response` double exercises — and a flush during the pause
-     * must not reach the socket at all.
-     */
-    public function testA429PausesForExactlyRetryAfterAndKeepsEveryEvent(): void
+    /** A rate limit never costs an event, and a flush during the pause must not open a connection. */
+    public function testAPausedSenderDoesNotReachTheSocketAgain(): void
     {
-        $before = microtime(true);
-        $requests = $this->drive('rate-limited', 3);
+        $requests = $this->drive('429-rate-limited', 3);
 
         self::assertCount(1, $requests);
-        self::assertSame(3, $this->queueCount(), 'a rate limit never drops an event');
-        $pausedUntil = (float) $this->client?->sender()->pausedUntil();
-        self::assertGreaterThanOrEqual($before + 59.0, $pausedUntil);
-        self::assertLessThanOrEqual(microtime(true) + 60.0, $pausedUntil);
+        self::assertSame(3, $this->queueCount());
 
         AnvilFeed::flush();
         self::assertCount(1, $this->requests(), 'a paused sender does not open a connection');
         self::assertSame(3, $this->queueCount());
     }
 
-    /** 503 repeats the WHOLE batch after Retry-After; (organisation, event_id) makes that idempotent. */
-    public function testA503KeepsTheWholeBatchAndPausesForExactlyRetryAfter(): void
+    /**
+     * A 5xx that is not 503. It is not in `responses/index.json` — the contract documents 503 as the
+     * transient answer — but a load balancer answers 500 and 502 all the same, and the rule is
+     * exponential backoff with jitter rather than a fixed pause, with the events kept.
+     */
+    public function testAnUnexpected5xxBacksOffWithJitterAndKeepsTheEvents(): void
     {
-        $before = microtime(true);
-        $this->drive('transient', 3);
+        $this->drive('unexpected-500', 2);
 
-        self::assertSame(3, $this->queueCount());
-        $pausedUntil = (float) $this->client?->sender()->pausedUntil();
-        self::assertGreaterThanOrEqual($before + 29.0, $pausedUntil);
-        self::assertLessThanOrEqual(microtime(true) + 30.0, $pausedUntil);
+        self::assertSame(2, $this->queueCount());
         self::assertFalse($this->client?->sender()->isStopped());
+        $waited = (float) $this->client?->sender()->pausedUntil() - $this->now;
+        // BACKOFF_BASE_MS 1000 with ±20% jitter on the first attempt — a range, not a fixed pause.
+        self::assertGreaterThanOrEqual(0.8, $waited);
+        self::assertLessThanOrEqual(1.2, $waited);
+        self::assertNotSame([], $this->written->matching('the ingest answered 500'));
     }
 
     /**
-     * A server that accepted the request and then never answered. The client's own budget has to be what
-     * ends the call — FR-2 c, and the reason `request_timeout_ms` exists at all — and the event has to
-     * survive: a timeout says nothing about whether the ingest would accept it.
+     * A server that accepted the request and then never answered. The client's own budget has to be
+     * what ends the call — FR-2 c, and the reason `request_timeout_ms` exists at all — and the event
+     * has to survive: a timeout says nothing about whether the ingest would accept it.
      *
      * The elapsed time is asserted, not just the outcome. The stub sleeps three seconds; a client that
      * honours a 300 ms budget comes back in well under one, and a client that does not passes every
@@ -272,8 +370,8 @@ final class MockServerTest extends TestCase
 
     /**
      * One typo in `endpoint` and a 30x is what the SDK meets. It is never followed: the redirect target
-     * would receive the `anv_srv_` token, and the redirect degrades POST to GET, so its 202 would be read
-     * as a delivery for events that were never in the second request.
+     * would receive the `anv_srv_` token, and the redirect degrades POST to GET, so its 202 would be
+     * read as a delivery for events that were never in the second request.
      *
      * The assertion is the absence of the file the redirect target writes the credential into — not the
      * absence of a second call in a mock, which is the same claim asserted against the wrong thing.
@@ -292,17 +390,83 @@ final class MockServerTest extends TestCase
         self::assertNotSame([], $this->written->matching('Location'));
     }
 
+    // ------------------------------------------ the request side of the contract
+
+    /**
+     * The stub's request rules have to be LIVE, or the standing check in every test above is a comment.
+     * Each of these is a request the real ingest refuses, made deliberately by this test — and the
+     * answer is the status the contract names. The SDK never makes one, which is what everything above
+     * proves.
+     *
+     * @return array<string, array{array<string, string>, string, int}>
+     */
+    public static function requestsTheIngestRefuses(): array
+    {
+        $event = '{"event_id":"9b1c7f2e-5a34-4c18-8e0d-1f7a2b3c4d5e"}';
+
+        return [
+            'an Origin header with a server token' => [
+                ['Origin' => 'https://evil.example', 'Authorization' => 'Bearer ' . self::TOKEN],
+                $event,
+                403,
+            ],
+            'no Authorization at all' => [[], $event, 401],
+            'a token that is not an anvil key' => [['Authorization' => 'Bearer hunter2'], $event, 401],
+            'a body that is not JSON' => [
+                ['Authorization' => 'Bearer ' . self::TOKEN],
+                'not json at all',
+                400,
+            ],
+        ];
+    }
+
+    /** @param array<string, string> $headers */
+    #[DataProvider('requestsTheIngestRefuses')]
+    public function testTheStubEnforcesTheIngestsOwnRequestRules(array $headers, string $body, int $expected): void
+    {
+        self::assertNotSame('', self::$base, 'the local ingest stub could not be started');
+
+        self::assertSame($expected, $this->rawPost('accepted', $headers, $body));
+    }
+
+    /** A batch above the ingest's limit of 50, and a body above its 262144 bytes. */
+    public function testTheStubRefusesAnOversizedBatchAndAnOversizedBody(): void
+    {
+        self::assertNotSame('', self::$base, 'the local ingest stub could not be started');
+        $headers = ['Authorization' => 'Bearer ' . self::TOKEN];
+        $event = '{"event_id":"9b1c7f2e-5a34-4c18-8e0d-1f7a2b3c4d5e"}';
+
+        self::assertSame(400, $this->rawPost('accepted', $headers,
+            '[' . implode(',', array_fill(0, 51, $event)) . ']'));
+        self::assertSame(413, $this->rawPost('accepted', $headers,
+            '{"event_id":"9b1c7f2e-5a34-4c18-8e0d-1f7a2b3c4d5e","title":"' . str_repeat('x', 300000) . '"}'));
+    }
+
+    /**
+     * And the SDK's own side of the same rules, asserted where it can be: a token the ingest would
+     * refuse earns a 401 from the stub's RULE rather than from a scenario, and the client stops. This
+     * is what makes the standing checks in every other test worth writing.
+     */
+    public function testAnUnusableTokenEarnsTheRefusalRatherThanBeingAnsweredByAScenario(): void
+    {
+        $this->drive('accepted', 1, ['token' => 'anv_srv_not_a_real_key'], expectDelivery: false);
+
+        self::assertTrue($this->client?->sender()->isStopped(),
+            'the stub refused the credential on its own rule — and the client stopped, as a 401 requires');
+        self::assertSame(0, $this->queueCount());
+    }
+
     // ------------------------------------------------------------- machinery
 
     /**
      * `AnvilFeed::init` → `captureException` × n → `flush`. The transport is the one `Client::create`
-     * builds for itself, so what is exercised is the chain a host application runs and not a wiring this
-     * test invented.
+     * builds for itself, so what is exercised is the chain a host application runs and not a wiring
+     * this test invented. The clock is injected and frozen.
      *
      * @param array<string, mixed> $options
      * @return list<array<string, mixed>> the requests the server actually received
      */
-    private function drive(string $scenario, int $events, array $options = []): array
+    private function drive(string $scenario, int $events, array $options = [], bool $expectDelivery = true): array
     {
         self::assertNotSame('', self::$base, 'the local ingest stub could not be started — this file is '
             . 'the only place the PHP SDK is held against a real HTTP conversation, so a run without it '
@@ -317,7 +481,7 @@ final class MockServerTest extends TestCase
             'environment' => 'production',
         ], $options), $logger);
 
-        $this->client = Client::create($config, null, $logger, GitContext::none());
+        $this->client = Client::create($config, null, $logger, GitContext::none(), fn (): float => $this->now);
         AnvilFeed::init($this->client);
 
         for ($i = 0; $i < $events; $i++) {
@@ -330,8 +494,69 @@ final class MockServerTest extends TestCase
         self::assertSame($events, $this->queueCount());
 
         AnvilFeed::flush();
+        $requests = $this->requests();
 
-        return $this->requests();
+        if ($expectDelivery) {
+            $this->assertNothingTheIngestWouldRefuseWasSent($requests);
+        }
+
+        return $requests;
+    }
+
+    /**
+     * The standing check. The stub applies these refusals before it looks at the scenario, so a run
+     * that came back with the status it asked for is already evidence — but the recorded request says
+     * it directly, for every request of every scenario, in the terms the contract uses.
+     *
+     * @param list<array<string, mixed>> $requests
+     */
+    private function assertNothingTheIngestWouldRefuseWasSent(array $requests): void
+    {
+        foreach ($requests as $request) {
+            self::assertSame('', $request['origin'], 'this SDK never sends an Origin; a server token '
+                . 'presented with one is treated as leaked and answered 403 before it is even read');
+            self::assertSame('Bearer ' . self::TOKEN, $request['authorization']);
+            self::assertSame('application/json', $request['content_type']);
+            self::assertStringStartsWith('anvil-feed-php/', $request['user_agent']);
+            self::assertNotSame('unreadable', $request['shape'], 'the body must be JSON the ingest can read');
+            self::assertLessThanOrEqual(50, $request['events'], 'the ingest answers 400 above 50');
+            self::assertLessThanOrEqual(262144, $request['bytes'], 'the ingest answers 413 above 262144');
+        }
+    }
+
+    /**
+     * A request this test makes itself, to prove the stub's own rules bite. Nothing of the SDK is
+     * involved; that is the point.
+     *
+     * @param array<string, string> $headers
+     */
+    private function rawPost(string $scenario, array $headers, string $body): int
+    {
+        $lines = ['Content-Type: application/json'];
+        foreach ($headers as $name => $value) {
+            $lines[] = $name . ': ' . $value;
+        }
+        $context = stream_context_create(['http' => [
+            'method' => 'POST',
+            'header' => implode("\r\n", $lines),
+            'content' => $body,
+            'timeout' => 5,
+            'ignore_errors' => true,
+            'follow_location' => 0,
+        ]]);
+        @file_get_contents(
+            self::$base . '/' . $this->run . '/' . $scenario . '/api/feed/events',
+            false,
+            $context
+        );
+
+        foreach ($http_response_header ?? [] as $line) {
+            if (preg_match('#^HTTP/\S+\s+(\d{3})#', $line, $match) === 1) {
+                return (int) $match[1];
+            }
+        }
+
+        return 0;
     }
 
     private function queueCount(): int
@@ -356,6 +581,22 @@ final class MockServerTest extends TestCase
         return $requests;
     }
 
+    /**
+     * @param array<string, mixed>|null $published
+     * @return list<string>
+     */
+    private function reasonCodes(?array $published): array
+    {
+        $codes = [];
+        foreach ($published['rejected'] ?? [] as $rejection) {
+            if (is_array($rejection) && isset($rejection['reason_code'])) {
+                $codes[] = (string) $rejection['reason_code'];
+            }
+        }
+
+        return $codes;
+    }
+
     private function requestLog(): string
     {
         return sys_get_temp_dir() . '/anvil-feed-stub-' . $this->run . '.jsonl';
@@ -364,6 +605,62 @@ final class MockServerTest extends TestCase
     private function leakMarker(): string
     {
         return sys_get_temp_dir() . '/anvil-feed-leaked-' . $this->run;
+    }
+
+    private static function startServer(): bool
+    {
+        $port = self::freePort();
+        if ($port === 0) {
+            return false;
+        }
+        $pipes = [];
+        $process = proc_open(
+            // `exec` so that proc_terminate() reaches `php -S` itself rather than the shell that
+            // started it — without it the orphan survives only by /bin/sh's last-command optimisation.
+            sprintf(
+                'exec %s -S 127.0.0.1:%d %s',
+                escapeshellarg(PHP_BINARY),
+                $port,
+                escapeshellarg(__DIR__ . '/stub-router.php')
+            ),
+            [1 => ['file', '/dev/null', 'w'], 2 => ['file', '/dev/null', 'w']],
+            $pipes,
+            null,
+            // The timeout scenario holds a worker for three seconds on purpose; a single-threaded
+            // server would turn that into a timeout for every test that ran after it.
+            ['PHP_CLI_SERVER_WORKERS' => '8'] + getenv()
+        );
+        if (!is_resource($process)) {
+            return false;
+        }
+        self::$server = $process;
+        $base = 'http://127.0.0.1:' . $port;
+
+        for ($attempt = 0; $attempt < 100; $attempt++) {
+            // Not merely "something answers on the port": the port was free a moment ago and anything
+            // could have taken it in between. The probe asks OUR stub for a scenario only it knows.
+            $answer = @file_get_contents(
+                $base . '/probe/an-unknown-scenario/api/feed/events',
+                false,
+                stream_context_create(['http' => [
+                    'method' => 'POST',
+                    'header' => "Content-Type: application/json\r\nAuthorization: Bearer " . self::TOKEN,
+                    'content' => '{"event_id":"9b1c7f2e-5a34-4c18-8e0d-1f7a2b3c4d5e"}',
+                    'timeout' => 0.5,
+                    'ignore_errors' => true,
+                ]])
+            );
+            if (is_string($answer) && str_contains($answer, 'unknown scenario')) {
+                self::$base = $base;
+                @unlink(sys_get_temp_dir() . '/anvil-feed-stub-probe.jsonl');
+
+                return true;
+            }
+            usleep(50_000);
+        }
+        self::stopServer();
+
+        return false;
     }
 
     private static function stopServer(): void
@@ -376,11 +673,12 @@ final class MockServerTest extends TestCase
         self::$base = '';
     }
 
+    /** 0 when no port could be found — a fixed fallback is how two suites collide on a busy box. */
     private static function freePort(): int
     {
-        $socket = stream_socket_server('tcp://127.0.0.1:0', $errno, $error);
+        $socket = @stream_socket_server('tcp://127.0.0.1:0', $errno, $error);
         if (!is_resource($socket)) {
-            return 8124;
+            return 0;
         }
         $name = (string) stream_socket_get_name($socket, false);
         fclose($socket);

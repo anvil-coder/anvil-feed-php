@@ -4,12 +4,14 @@ declare(strict_types=1);
 
 namespace AnvilFeed\Tests\Conformance;
 
+use AnvilFeed\AnvilFeed;
 use AnvilFeed\Client;
 use AnvilFeed\Config;
 use AnvilFeed\Event;
 use AnvilFeed\GitContext;
 use AnvilFeed\Logger;
 use AnvilFeed\Scrubber;
+use AnvilFeed\Tests\Support\ConformanceCaller;
 use AnvilFeed\Tests\Support\RecordingLogger;
 use AnvilFeed\Tests\Support\RecordingTransport;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -42,37 +44,71 @@ final class FixtureConformanceTest extends TestCase
     /** The canonical UUID `event_id` must be; `rejected/bad-event-id.json` is a ULID. */
     private const CANONICAL_UUID = '/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i';
 
+    /** The address `conformance/pii/raw.json` plants, used wherever a real one is needed. */
+    private const ADDRESS = '203.0.113.9';
+
+    protected function tearDown(): void
+    {
+        AnvilFeed::reset();
+    }
+
     // ---------------------------------------------------------------- valid/
 
     /**
-     * The fixture is reproduced field for field, `assertSame` on the whole array — so the KEY ORDER is
-     * part of the promise as well. Only the three values that cannot be equal are substituted: a fresh
-     * UUID, the current instant, and the stack, which belongs to whichever file did the capturing.
+     * The fixture is reproduced FIELD FOR FIELD — `assertSame` on the whole array, so key order is part
+     * of the promise, and the `stacktrace` is compared rather than substituted away.
+     *
+     * That last part is the whole reason this test was rewritten. Comparing everything except the stack
+     * is what let an SDK that led every message event with three of its OWN frames pass a file whose
+     * subject is "the SDK must produce it". So the capture is made from
+     * {@see \AnvilFeed\Tests\Support\ConformanceCaller} — a stand-in for customer code, in its own
+     * file — and the fixture names that file, that line and `in_app: true`.
+     *
+     * Two values still cannot be equal to a fixture's and are substituted: a fresh UUID and the current
+     * instant. One is normalised: the frame's absolute path, cut down to a repository-relative one,
+     * because a golden document cannot carry this machine's home directory.
      */
-    public function testTheMessageEventIsReproducedFieldForField(): void
+    public function testTheMessageEventIsReproducedFieldForFieldIncludingTheCallersStack(): void
     {
         $expected = $this->fixture('valid/message-event.json');
-        $client = $this->client();
-        $client->captureMessage('Payment reconciliation skipped for 3 accounts', 'warning');
-        $actual = $this->onlyQueuedEvent($client);
+        $client = $this->goldenClient();
+        AnvilFeed::init($client);
 
-        $this->assertTheStackIsRealBeforeItIsSubstituted($actual);
-        $actual = $this->substituteTheUnequalFields($actual, $expected);
+        ConformanceCaller::message('Payment reconciliation skipped for 3 accounts');
 
+        $actual = $this->asAGoldenDocument($this->onlyQueuedEvent($client), $expected);
         self::assertSame($expected, $actual);
     }
 
-    public function testTheTestEventIsReproducedFieldForField(): void
+    public function testTheTestEventIsReproducedFieldForFieldIncludingTheCallersStack(): void
     {
         $expected = $this->fixture('valid/test-event.json');
-        $client = $this->client();
-        $client->captureTestEvent();
-        $actual = $this->onlyQueuedEvent($client);
+        $client = $this->goldenClient();
+        AnvilFeed::init($client);
 
-        $this->assertTheStackIsRealBeforeItIsSubstituted($actual);
-        $actual = $this->substituteTheUnequalFields($actual, $expected);
+        ConformanceCaller::testEvent();
 
+        $actual = $this->asAGoldenDocument($this->onlyQueuedEvent($client), $expected);
         self::assertSame($expected, $actual);
+    }
+
+    /**
+     * The same claim stated the other way round, because the comparison above would also pass if the
+     * fixture were wrong in the same direction: no frame of any event this SDK builds may be a file of
+     * this SDK. An event whose stack leads with the reporting library is what an operator opens in the
+     * cockpit, and it is what made every `captureMessage()` in an application one incident.
+     */
+    public function testNoEventEverCarriesAFrameOfThisSdk(): void
+    {
+        $ourSource = realpath(__DIR__ . '/../../src');
+        self::assertIsString($ourSource);
+
+        foreach ($this->hostileCorpus() as $what => $payload) {
+            foreach ($payload['exception']['stacktrace'] ?? [] as $frame) {
+                self::assertStringStartsNotWith($ourSource, (string) ($frame['file'] ?? ''),
+                    'the stack of "' . $what . '" leads with a file of the SDK itself');
+            }
+        }
     }
 
     /**
@@ -103,6 +139,8 @@ final class FixtureConformanceTest extends TestCase
         // …and the two fields minimal.json leaves out are the ones this SDK always adds.
         self::assertSame("Cannot read property 'id' of undefined", $full['exception']['message']);
         self::assertNotSame([], $full['exception']['stacktrace']);
+        // The throw site is where the caller raised it, which for an exception is this very line.
+        self::assertSame(__FILE__, $full['exception']['stacktrace'][0]['file']);
     }
 
     /**
@@ -155,6 +193,108 @@ final class FixtureConformanceTest extends TestCase
         self::assertSame($expected, $scrubbed);
         // The negative control: the fixture pair must actually differ, or this test passes on a copy.
         self::assertNotSame($expected, $raw, 'pii/raw.json and pii/expected.json are the same document');
+    }
+
+    /**
+     * The same pair, through the PUBLIC API. The assertion above is made on a `Scrubber` this test
+     * builds; the client builds its own from `$config->denylist`, and a configuration path that stopped
+     * reaching it would leave the exact-pair test green while every event in production travelled
+     * unscrubbed. So the raw fixture's own context is handed to `captureException` and what comes out is
+     * compared to `pii/expected.json`, field by field, for every field the public API can carry.
+     *
+     * `context_code` and `user.ip` are not among them — the first is read from the file a frame points
+     * at, the second cannot be set through this API at all (it has its own corpus entries above) — and
+     * the exception MESSAGE is, which is the field the raw fixture plants a bearer token in.
+     */
+    public function testTheScrubberContractAlsoHoldsThroughThePublicCaptureApi(): void
+    {
+        $raw = $this->fixture('pii/raw.json');
+        $expected = $this->fixture('pii/expected.json');
+
+        $client = $this->client();
+        $client->captureException(new \RuntimeException($raw['exception']['message']), [
+            'request' => $raw['request'],
+            'user_id' => $raw['user']['id'],
+            'breadcrumbs' => $raw['breadcrumbs'],
+            'tags' => $raw['tags'],
+        ]);
+        $wire = $this->onlyQueuedEvent($client);
+
+        self::assertSame($expected['exception']['message'], $wire['exception']['message']);
+        self::assertSame($expected['request'], $wire['request']);
+        self::assertSame($expected['user'], $wire['user']);
+        self::assertSame($expected['breadcrumbs'], $wire['breadcrumbs']);
+        self::assertSame($expected['tags'], $wire['tags']);
+
+        // And the negative control: every value the fixture pair says had to go is absent from the
+        // whole serialised event, not merely from the field it was passed in.
+        $serialised = json_encode($wire, JSON_THROW_ON_ERROR);
+        foreach (['eyJhbGciOiJIUzI1NiJ9.abc', 'sk-live-99887766', 'ada@example.org',
+                  '4111111111111111', 'CH9300762011623852957', 'abc123', 'sid=abc'] as $secret) {
+            self::assertStringNotContainsString($secret, $serialised);
+        }
+    }
+
+    /**
+     * FR-5 c, stated as a literal rather than as a key that happens to be absent. The address is offered
+     * by every route the public API has — a `user` context block, a `beforeSend` hook, and a tag whose
+     * key is the scrubber's business — and must be on the wire by none of them.
+     */
+    public function testAnAddressNeverReachesTheWireByAnyRouteThePublicApiOffers(): void
+    {
+        foreach ($this->hostileCorpus() as $what => $payload) {
+            self::assertStringNotContainsString(
+                self::ADDRESS,
+                json_encode($payload, JSON_THROW_ON_ERROR),
+                'a caller-supplied address reached the wire, capturing: ' . $what
+            );
+        }
+    }
+
+    /**
+     * `event_id` is the delivery key: `Sender::applyVerdicts` matches the ingest's answer on the Event's
+     * own id, so a body naming a different one is never found in `accepted`, is sent once more and is
+     * then dropped with a line blaming the network for what host code did. It is also the id
+     * `captureTestEvent()` hands an operator to search for.
+     */
+    public function testABeforeSendHookCannotRewriteTheDeliveryKey(): void
+    {
+        $client = $this->client();
+        $client->beforeSend(static function (array $payload): array {
+            $payload['event_id'] = '01JBQ8Z0000000000000000000';   // a ULID, rejected/bad-event-id.json
+
+            return $payload;
+        });
+
+        $id = $client->captureException(new \RuntimeException('boom'));
+        $wire = $this->onlyQueuedEvent($client);
+
+        self::assertSame($id, $wire['event_id'], 'the queued body must name the id the caller was given');
+        self::assertSame(1, preg_match(self::CANONICAL_UUID, (string) $wire['event_id']));
+    }
+
+    /**
+     * FR-5 applies to what the hook ADDS, not only to what the SDK built. A host that enriches an event
+     * with a tag out of its own request context is the normal use of `beforeSend`, and the value it
+     * reaches for is as likely to be a secret as anything the SDK collected itself.
+     */
+    public function testWhatABeforeSendHookAddsIsScrubbedBeforeItReachesTheWire(): void
+    {
+        $client = $this->client();
+        $client->beforeSend(static function (array $payload): array {
+            $payload['tags'] = ['password' => 'hunter2', 'tier' => 'gold'];
+            $payload['breadcrumbs'] = ['GET /callback?api_key=sk-live-99887766'];
+
+            return $payload;
+        });
+
+        $client->captureException(new \RuntimeException('boom'));
+        $wire = $this->onlyQueuedEvent($client);
+
+        self::assertSame('[Filtered]', $wire['tags']['password']);
+        self::assertSame('gold', $wire['tags']['tier'], 'an ordinary tag still travels');
+        self::assertStringNotContainsString('hunter2', json_encode($wire, JSON_THROW_ON_ERROR));
+        self::assertStringNotContainsString('sk-live-99887766', json_encode($wire, JSON_THROW_ON_ERROR));
     }
 
     // ------------------------------------------ rejected/ and sdk-forbidden/
@@ -336,11 +476,48 @@ final class FixtureConformanceTest extends TestCase
                 'request' => ['method' => 'GET', 'url' => 'file:///etc/passwd'],
             ])
         );
-        yield 'a caller-supplied address and pseudonym' => $this->captured(
+        yield 'a caller-supplied copy of the ingest\'s own pseudonym' => $this->captured(
             fn (Client $c) => $c->captureException(new \OverflowException('boom'), [
                 'user_id' => 'u-4711',
-                'tags' => ['ip' => '203.0.113.9', 'user.ip_hash' => 'deadbeef', 'tier' => 'gold'],
+                'tags' => ['user.ip_hash' => 'deadbeef', 'tier' => 'gold'],
             ])
+        );
+        // FR-5 c through the public API. EventFactory writes `user` from `user_id` alone today, so a
+        // `user` context block is the input a future adapter (Laravel has $request->ip() in hand) would
+        // reach for — and the one that must not put an address on the wire. Asserted again, on the
+        // literal, by testAnAddressNeverReachesTheWireByAnyRoute below.
+        yield 'a caller-supplied address in a user block' => $this->captured(
+            fn (Client $c) => $c->captureException(new \RuntimeException('boom'), [
+                'user_id' => 'u-4711',
+                'user' => ['id' => 'u-4711', 'ip' => self::ADDRESS],
+            ])
+        );
+        // beforeSend is the one public input that can still put arbitrary members into a built event,
+        // which makes it the only route by which `user.ip` and `tags['user.ip_hash']` are reachable at
+        // all. Its output goes through the factory's scrub → bound → prune pipeline a second time; this
+        // corpus entry is what holds that promise to every predicate in the file at once.
+        yield 'a beforeSend hook that adds an address and a pseudonym' => $this->captured(
+            fn (Client $c) => $c->captureException(new \LengthException('boom')),
+            [],
+            static fn (Client $c) => $c->beforeSend(static function (array $payload): array {
+                $payload['user'] = ['id' => 'u-4711', 'ip' => self::ADDRESS];
+                $payload['tags'] = ['user.ip_hash' => 'deadbeef', 'tier' => 'gold'];
+
+                return $payload;
+            })
+        );
+        yield 'a beforeSend hook that adds secrets and rewrites what the SDK owns' => $this->captured(
+            fn (Client $c) => $c->captureException(new \OutOfBoundsException('boom')),
+            [],
+            static fn (Client $c) => $c->beforeSend(static function (array $payload): array {
+                $payload['event_id'] = 'not-a-uuid-at-all';
+                $payload['service'] = str_repeat('a', 300);
+                $payload['schema_version'] = '0.9';
+                $payload['tags'] = ['password' => 'hunter2', 'api_key' => 'sk-live-99887766'];
+                $payload['breadcrumbs'] = ['GET /reset?token=abc123'];
+
+                return $payload;
+            })
         );
         yield 'a 300-character service name' => $this->captured(
             fn (Client $c) => $c->captureException(new \RangeException('boom')),
@@ -367,11 +544,15 @@ final class FixtureConformanceTest extends TestCase
     /**
      * @param callable(Client): ?string $capture
      * @param array<string, mixed> $options
+     * @param null|callable(Client): void $configure runs before the capture — where a beforeSend goes
      * @return array<string, mixed>
      */
-    private function captured(callable $capture, array $options = []): array
+    private function captured(callable $capture, array $options = [], ?callable $configure = null): array
     {
         $client = $this->client($options);
+        if ($configure !== null) {
+            $configure($client);
+        }
         $id = $capture($client);
 
         self::assertNotNull($id, 'the capture was dropped; this corpus entry would prove nothing');
@@ -392,6 +573,13 @@ final class FixtureConformanceTest extends TestCase
                 'token' => 'anv_srv_0123456789abcdef0123456789abcdef',
                 'service' => 'disponio-api',
                 'environment' => 'production',
+                // context_code is switched OFF throughout this file, and the reason is a trap this
+                // project has now paid for three times: with it on, every frame quotes the source of
+                // THIS file, so a secret written as a literal in an assertion comes back inside the
+                // event as source code and reddens a leak test that is measuring nothing. The bounds
+                // and the scrubbing of real context code are proved in SchemaConformanceTest, against
+                // a GENERATED probe file, which is where that proof belongs.
+                'context_lines' => 0,
             ], $options), $logger),
             new RecordingTransport(),
             $logger,
@@ -406,18 +594,6 @@ final class FixtureConformanceTest extends TestCase
         self::assertCount(1, $queued, 'exactly one event should have been queued');
 
         return $queued[0]->payload;
-    }
-
-    /** @param array<string, mixed> $payload */
-    private function assertTheStackIsRealBeforeItIsSubstituted(array $payload): void
-    {
-        $frames = $payload['exception']['stacktrace'] ?? null;
-        self::assertIsArray($frames);
-        self::assertNotSame([], $frames, 'the stack is substituted below, so it must exist first');
-        self::assertArrayHasKey('file', $frames[0]);
-        self::assertArrayHasKey('line', $frames[0]);
-        self::assertArrayHasKey('function', $frames[0]);
-        self::assertArrayHasKey('in_app', $frames[0]);
     }
 
     /**
@@ -438,11 +614,47 @@ final class FixtureConformanceTest extends TestCase
 
         $actual['event_id'] = $expected['event_id'];
         $actual['timestamp'] = $expected['timestamp'];
-        if (isset($expected['exception']['stacktrace'])) {
-            $actual['exception']['stacktrace'] = $expected['exception']['stacktrace'];
-        }
 
         return $actual;
+    }
+
+    /**
+     * A captured event as a golden document: the two unequal values substituted, and every frame's
+     * absolute path cut down to a repository-relative one. The prefix is asserted to have been there,
+     * so a frame from somewhere else cannot be normalised into agreement by accident.
+     *
+     * @param array<string, mixed> $actual
+     * @param array<string, mixed> $expected
+     * @return array<string, mixed>
+     */
+    private function asAGoldenDocument(array $actual, array $expected): array
+    {
+        $root = realpath(self::REPOSITORY);
+        self::assertIsString($root);
+
+        $frames = $actual['exception']['stacktrace'] ?? [];
+        self::assertIsArray($frames);
+        self::assertCount(1, $frames, 'the golden client asks for one frame, so the fixture can carry it');
+
+        foreach ($frames as $index => $frame) {
+            $file = (string) ($frame['file'] ?? '');
+            self::assertStringStartsWith($root . '/', $file,
+                'the frame is not in this repository, so normalising it would hide what it really is');
+            $frames[$index]['file'] = substr($file, strlen($root) + 1);
+        }
+        $actual['exception']['stacktrace'] = $frames;
+
+        return $this->substituteTheUnequalFields($actual, $expected);
+    }
+
+    /**
+     * The client the two golden documents are captured with: one frame and no context code, because a
+     * fixture checked into a repository cannot carry a machine's whole stack or the source of the file
+     * it happened to be raised in. Everything else is the default.
+     */
+    private function goldenClient(): Client
+    {
+        return $this->client(['max_frames' => 1]);
     }
 
     /** @return list<array<string, mixed>> */

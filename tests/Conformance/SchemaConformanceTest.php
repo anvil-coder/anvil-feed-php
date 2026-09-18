@@ -8,7 +8,9 @@ use AnvilFeed\Config;
 use AnvilFeed\Event;
 use AnvilFeed\EventFactory;
 use AnvilFeed\GitContext;
+use AnvilFeed\Logger;
 use AnvilFeed\Scrubber;
+use AnvilFeed\Tests\Support\RecordingLogger;
 use PHPUnit\Framework\TestCase;
 
 /**
@@ -29,11 +31,14 @@ final class SchemaConformanceTest extends TestCase
 
     private function factory(array $options = []): EventFactory
     {
+        // A recording sink rather than the default error_log: two of the cases below are SUPPOSED to
+        // produce an init line (the over-long service, the repaired environment), and a suite that
+        // printed them into the run teaches the next reader to ignore its output.
         $config = Config::fromArray(array_merge([
             'token' => 'anv_srv_0123456789abcdef0123456789abcdef',
             'service' => 'disponio-api',
             'environment' => 'production',
-        ], $options));
+        ], $options), new Logger(new RecordingLogger()));
 
         return new EventFactory($config, new Scrubber(Config::DEFAULT_DENYLIST), GitContext::none());
     }

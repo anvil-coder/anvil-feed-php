@@ -10,6 +10,8 @@ use AnvilFeed\Config;
 use AnvilFeed\Fingerprint;
 use AnvilFeed\GitContext;
 use AnvilFeed\Logger;
+use AnvilFeed\Tests\Support\AnotherConformanceCaller;
+use AnvilFeed\Tests\Support\ConformanceCaller;
 use AnvilFeed\Tests\Support\RecordingLogger;
 use AnvilFeed\Tests\Support\RecordingTransport;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -223,18 +225,16 @@ final class FingerprintConformanceTest extends TestCase
     }
 
     /**
-     * `frames` when there is a stack, `title` when there is not — the vectors' shape tag, through the
-     * API. `captureMessage` synthesises its stack from the caller's backtrace, so both events have one;
-     * what this pins is that two DIFFERENT messages raised from the same line share a fingerprint, which
-     * is the `frames` branch and is the reading under which the cap is safe: the local gate drops exactly
-     * what the cockpit would have shown as one incident.
+     * Two `captureMessage()` calls from the SAME site are one identity. That is the reading under which
+     * the local cap is safe — it drops exactly what the cockpit would have shown as one incident — and
+     * the message text is deliberately not part of it.
      */
     public function testTwoMessagesFromOneSiteAreOneIdentity(): void
     {
         $client = $this->initClient(new RecordingLogger(), ['fingerprint_cap' => 50]);
 
-        AnvilFeed::captureMessage('Payment reconciliation skipped for 3 accounts', 'warning');
-        AnvilFeed::captureMessage('Payment reconciliation skipped for 9 accounts', 'warning');
+        ConformanceCaller::message('Payment reconciliation skipped for 3 accounts');
+        ConformanceCaller::message('Payment reconciliation skipped for 9 accounts');
 
         $events = $client->queue()->take(2);
         self::assertCount(2, $events);
@@ -243,6 +243,71 @@ final class FingerprintConformanceTest extends TestCase
             Fingerprint::ofEvent($events[1]->payload),
             'the message is not part of the identity; the site is'
         );
+    }
+
+    /**
+     * …and the assertion without which the one above is vacuous. Until Task 3's fix, a message event's
+     * stack led with `src/Client.php` whatever the caller was, so EVERY `captureMessage()` anywhere in
+     * an application shared one fingerprint — "two messages from one site agree" was true of two
+     * messages from anywhere at all, and the local cap silenced a whole application's log lines after
+     * ten of them.
+     *
+     * The two calls are in two different FILES (`tests/Support/`), not two methods of this class, so
+     * nothing but the frame can tell them apart.
+     */
+    public function testTwoMessagesFromDifferentFilesAreDifferentIdentities(): void
+    {
+        $client = $this->initClient(new RecordingLogger(), ['fingerprint_cap' => 50]);
+
+        ConformanceCaller::message('the same words from two different files');
+        AnotherConformanceCaller::message('the same words from two different files');
+
+        $events = $client->queue()->take(2);
+        self::assertCount(2, $events);
+        self::assertNotSame(
+            $events[0]->payload['exception']['stacktrace'][0]['file'],
+            $events[1]->payload['exception']['stacktrace'][0]['file'],
+            'the two calls must really be in two files, or the assertion below proves nothing'
+        );
+        self::assertNotSame(
+            Fingerprint::ofEvent($events[0]->payload),
+            Fingerprint::ofEvent($events[1]->payload),
+            'two faults in two files are two incidents; one fingerprint for both is an SDK that put its '
+            . 'own frames in front of the caller\'s'
+        );
+    }
+
+    /**
+     * The gate's table is bounded (500 fingerprints), and what it does when it is full decides whether
+     * the cap means anything: an implementation that evicted the OLDEST entry to make room would evict
+     * the storming one — it has been there longest — and the storm would start counting from zero and
+     * be reported again, forever.
+     *
+     * Driven through the facade with more distinct faults than the table holds. Each churn fault is its
+     * own exception class, because the fingerprint is (service, type, top frames) and every other lever
+     * a test has — the message, the line number — is deliberately not part of it.
+     */
+    public function testAStormingFingerprintSurvivesAChurnOfMoreDistinctFaultsThanTheGateCanHold(): void
+    {
+        $client = $this->initClient(new RecordingLogger(), ['fingerprint_cap' => 3]);
+
+        for ($i = 0; $i < 10; $i++) {
+            AnvilFeed::captureException(new \RuntimeException('the hot fault'));
+        }
+        self::assertSame(3, $client->queue()->count(), 'the hot fault is capped before the churn');
+
+        // 520 > RateGate::MAX_TRACKED (500). Every one of these is a new identity the gate has to find
+        // room for while the hot one is still live.
+        for ($i = 0; $i < 520; $i++) {
+            AnvilFeed::captureException($this->aFaultNobodyHasSeenBefore($i));
+        }
+
+        $before = $client->queue()->count();
+        AnvilFeed::captureException(new \RuntimeException('the hot fault, once more'));
+
+        self::assertSame($before, $client->queue()->count(),
+            'the churn made room by evicting the fingerprint that was being capped — so the storm it was '
+            . 'holding back is reportable again, which is the cap doing nothing at all');
     }
 
     /**
@@ -309,6 +374,22 @@ final class FingerprintConformanceTest extends TestCase
         AnvilFeed::init($client);
 
         return $client;
+    }
+
+    /**
+     * A throwable of a class that has never existed before. `eval` is the only way to make one at
+     * runtime, and a fingerprint churn needs distinct TYPES: the message and the line number are
+     * deliberately not part of the identity, and the frames of a loop in one method are identical.
+     */
+    private function aFaultNobodyHasSeenBefore(int $index): \Throwable
+    {
+        $class = 'AnvilFeedChurnFault' . $index;
+        if (!class_exists($class, false)) {
+            eval('class ' . $class . ' extends \RuntimeException {}');
+        }
+        self::assertTrue(class_exists($class, false), 'the churn needs a distinct exception type');
+
+        return new $class('churn');
     }
 
     /** The vectors' own note: U+001F, the length in UTF-16 code units, ':', the value. */
