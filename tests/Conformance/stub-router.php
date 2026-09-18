@@ -90,19 +90,21 @@ $indexEntry = static function (string $wanted) use ($responses): ?array {
 /**
  * The ingest's own refusals, applied before the scenario and regardless of it.
  *
- * - `Origin` present → 403. The contract checks it BEFORE the token, because a server credential
- *   presented from a browser context is treated as leaked whatever the credential is.
  * - no bearer, or one that is not an `anv_` key → 401, with NO body: a finer answer would tell an
- *   attacker which half was wrong.
+ *   attacker which half was wrong. This comes FIRST — the running ingest (AnvilFeedIngestController)
+ *   resolves the credential before it looks at `Origin`; the published contract's "refused with 403,
+ *   whatever the token says" is not what the code does (dark-factory issue #338).
+ * - `Origin` present with a resolved server credential → 403: a server credential presented from a
+ *   browser context is treated as leaked.
  * - body over 262144 bytes → 413 with `payload_too_large`.
  * - a body that is not JSON, or a batch of more than 50 → 400 with `schema_violation`.
  */
 $refuse = static function () use ($origin, $authorization, $body, $decoded, $isArrayShape): ?int {
-    if ($origin !== '') {
-        return 403;
-    }
     if (preg_match('/^Bearer anv_(srv|pub)_[0-9a-f]{32}$/', $authorization) !== 1) {
         return 401;
+    }
+    if ($origin !== '') {
+        return 403;
     }
     if (strlen($body) > 262144) {
         return 413;

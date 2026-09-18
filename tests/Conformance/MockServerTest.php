@@ -411,6 +411,13 @@ final class MockServerTest extends TestCase
                 403,
             ],
             'no Authorization at all' => [[], $event, 401],
+            // The server's order (dark-factory issue #338): the credential is checked before Origin is read,
+            // so an Origin on a refused token is a 401, not the contract's "403 whatever the token says".
+            'an Origin header with a malformed token' => [
+                ['Origin' => 'https://evil.example', 'Authorization' => 'Bearer hunter2'],
+                $event,
+                401,
+            ],
             'a token that is not an anvil key' => [['Authorization' => 'Bearer hunter2'], $event, 401],
             'a body that is not JSON' => [
                 ['Authorization' => 'Bearer ' . self::TOKEN],
