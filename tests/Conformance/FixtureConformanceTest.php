@@ -531,6 +531,35 @@ final class FixtureConformanceTest extends TestCase
                 return $payload;
             })
         );
+        // The COUNT caps, which the second pipeline pass did not re-apply (finding 3 of the Java core's
+        // task-6 review). Enrichment is the single most obvious use of beforeSend, and one tag past the
+        // twenty-nine the schema allows — or one breadcrumb past thirty, or one frame past max_frames —
+        // costs the whole event to `schema_violation` at the ingest, for a field the sender never noticed.
+        // The three numbers here are each exactly one over the cap, so the guard cannot pass by reaching it.
+        yield 'a beforeSend hook that adds a 30th tag, a 31st breadcrumb and a 51st frame' => $this->captured(
+            fn (Client $c) => $c->captureException(new \RuntimeException('boom')),
+            [],
+            static fn (Client $c) => $c->beforeSend(static function (array $payload): array {
+                $payload['tags'] = [];
+                for ($i = 1; $i <= 30; $i++) {
+                    $payload['tags']['tag-' . $i] = 'value-' . $i;
+                }
+                $payload['breadcrumbs'] = [];
+                for ($i = 1; $i <= 31; $i++) {
+                    $payload['breadcrumbs'][] = 'step ' . $i;
+                }
+                // Ignored by design — `exception.stacktrace` is one of the members
+                // Client::withReadOnlyFieldsRestored() puts back, so no hook can inflate the stack through
+                // the public API. It is written here so that the guard says which half of the finding this
+                // route can reach; the frame cap itself is proved on `finalise()`, where it is reachable,
+                // by EventFactoryTest::testFinaliseReAppliesEveryCountCapABeforeSendHookCanBreak.
+                $payload['exception']['stacktrace'] = array_fill(0, 51, [
+                    'file' => 'app/Frame.php', 'line' => 1, 'function' => 'handle', 'in_app' => true,
+                ]);
+
+                return $payload;
+            })
+        );
         yield 'a 300-character service name' => $this->captured(
             fn (Client $c) => $c->captureException(new \RangeException('boom')),
             ['service' => str_repeat('a', 300)]

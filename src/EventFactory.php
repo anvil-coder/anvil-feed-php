@@ -185,15 +185,13 @@ final class EventFactory
                 static fn ($crumb) => is_string($crumb) ? $crumb : (string) json_encode($crumb),
                 array_values($context['breadcrumbs'])
             );
-            // The TAIL: it explains the fault. The ingest keeps the last MAX_BREADCRUMBS and so do we.
-            $payload['breadcrumbs'] = array_slice($crumbs, -self::MAX_BREADCRUMBS);
+            // NOT cut here. boundCounts() is the one place every count cap is applied — to this payload
+            // and to a beforeSend hook's output alike — so that the two can never drift apart.
+            $payload['breadcrumbs'] = $crumbs;
         }
         if (!empty($context['tags']) && is_array($context['tags'])) {
             $tags = [];
             foreach ($context['tags'] as $key => $value) {
-                if (count($tags) >= self::MAX_TAGS) {
-                    break;
-                }
                 $tags[(string) $key] = is_scalar($value)
                     ? (string) $value
                     : (string) json_encode($value);
@@ -208,10 +206,10 @@ final class EventFactory
             ], static fn ($v) => $v !== null);
         }
 
-        // The order is the whole point of these three lines and it is the SERVER's order
+        // The order is the whole point of these lines and it is the SERVER's order
         // (IncidentRedaction.redact: redact, then truncate to the cap):
         //   1. scrub   — the only step that may GROW a value, [Filtered] being ten characters
-        //   2. bound   — every cap applied to what scrubbing actually produced
+        //   2. bound   — every cap, of characters and of counts, applied to what scrubbing produced
         //   3. drop    — the members the contract refuses, and then the maps they leave empty
         return new Event($id, Event::inCanonicalOrder($this->finalise($payload)));
     }
@@ -225,12 +223,19 @@ final class EventFactory
      * having never met the denylist. `Scrubber::scrub` is idempotent, so a second pass over an already
      * scrubbed payload costs one walk and cannot double-filter.
      *
+     * "Bound" is both kinds of bound: the per-value character caps AND the counts. A hook that adds a
+     * thirtieth tag to a full event used to pass straight through here, and `tags` is `maxProperties: 29`
+     * in schema 1.0 — so the ingest answered `schema_violation` and the event was lost for a field the
+     * sender never noticed.
+     *
      * @param array<string, mixed> $payload
      * @return array<string, mixed>
      */
     public function finalise(array $payload): array
     {
-        $payload = $this->dropUnsendable($this->boundTexts($this->scrubber->scrub($payload)));
+        $payload = $this->dropUnsendable(
+            $this->boundCounts($this->boundTexts($this->scrubber->scrub($payload)))
+        );
         // The level enum is re-applied HERE and not only in build(): finalise() is also the second pass a
         // beforeSend result takes, and a hook that writes `level: "info"` used to reach the wire — the
         // ingest stores it, so nothing complains (sdk-forbidden/level-info.json, task-4 fix round).
@@ -286,6 +291,50 @@ final class EventFactory
                     $payload[$block][$key] = $this->clip($value, self::MAX_SHORT_TEXT_CHARS);
                 }
             }
+        }
+
+        return $payload;
+    }
+
+    /**
+     * Every bound that is a COUNT, in the direction the server keeps: tags the first 29 by insertion order,
+     * breadcrumbs the last 30, frames the first `max_frames` of a most-recent-first stack.
+     *
+     * This is the only place they are applied. `build()` used to cut the tags and the breadcrumbs itself and
+     * `finalise()` re-applied nothing, so the second pipeline pass — the one a `beforeSend` result takes, and
+     * the one whose contract says it is the same pipeline — let a thirtieth tag, a thirty-first breadcrumb
+     * and a fifty-first frame reach the wire, where schema 1.0 refuses all three and the event is lost.
+     * Having one helper rather than two copies is what keeps the two passes from drifting apart again.
+     *
+     * `framesOf()` still stops collecting at `max_frames`, and that is not a second copy of this rule: it is
+     * there so that the frames beyond the cap never cost a source-file read for a `context_code` this method
+     * would throw away. The cap that decides what travels is this one.
+     *
+     * @param array<string, mixed> $payload
+     * @return array<string, mixed>
+     */
+    private function boundCounts(array $payload): array
+    {
+        if (isset($payload['tags']) && is_array($payload['tags']) && count($payload['tags']) > self::MAX_TAGS) {
+            // The FRONT: AnvilFeedEventMapper.tags() keeps the first thirty by insertion order and spends
+            // the first slot on the server's own pseudonym, so the sender's own first 29 are what survives.
+            $payload['tags'] = array_slice($payload['tags'], 0, self::MAX_TAGS, true);
+        }
+        if (isset($payload['breadcrumbs']) && is_array($payload['breadcrumbs'])) {
+            // The TAIL: it is the tail that explains the fault, and it is the tail the ingest keeps
+            // (IncidentDelivery.redactedBreadcrumbs). array_values because schema 1.0 types this as a JSON
+            // array: a map left behind by a hook, or the gap a slice leaves, would serialise as an object.
+            $payload['breadcrumbs'] = array_values(
+                array_slice($payload['breadcrumbs'], -self::MAX_BREADCRUMBS)
+            );
+        }
+        if (isset($payload['exception']['stacktrace']) && is_array($payload['exception']['stacktrace'])) {
+            // The HEAD: the stack is most-recent-first, frame 0 is the crash site, and the ingest keeps the
+            // head too (IncidentDelivery.redactedFrames). Dropping from the front would keep the 50 least
+            // interesting frames and fingerprint the fault on somebody else's code.
+            $payload['exception']['stacktrace'] = array_values(
+                array_slice($payload['exception']['stacktrace'], 0, $this->config->maxFrames)
+            );
         }
 
         return $payload;

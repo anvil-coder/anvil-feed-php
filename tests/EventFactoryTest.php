@@ -219,4 +219,58 @@ final class EventFactoryTest extends TestCase
         self::assertSame($payload, $factory->finalise($payload),
             'a second pass over an already finalised payload changed it');
     }
+
+    /**
+     * Finding 3 of the Java core's task-6 review. `finalise()` re-applied scrubbing, every per-value
+     * character cap, the drop rules and the level enum — and never re-counted anything. The single most
+     * obvious use of `beforeSend` is enrichment (`$payload['tags']['tenant'] = …`) on an event that already
+     * carries twenty-nine tags; the thirtieth reached the wire, `tags` is `maxProperties: 29` in schema 1.0,
+     * and the ingest answered `schema_violation` for a field the sender never noticed. Same for a hook that
+     * appends to a full breadcrumb list or replaces a stacktrace.
+     *
+     * Each of the three numbers below is exactly ONE over its cap, so the guard cannot pass by merely
+     * reaching it, and each direction is asserted on the element that survives rather than on a count alone.
+     */
+    public function testFinaliseReAppliesEveryCountCapABeforeSendHookCanBreak(): void
+    {
+        $factory = $this->factory(['context_lines' => 0]);
+        $payload = $factory->fromThrowable(new \RuntimeException('boom'))->payload;
+
+        $payload['tags'] = [];
+        for ($i = 1; $i <= 30; $i++) {
+            $payload['tags']['tag-' . $i] = 'value-' . $i;
+        }
+        $payload['breadcrumbs'] = [];
+        for ($i = 1; $i <= 31; $i++) {
+            $payload['breadcrumbs'][] = 'step ' . $i;
+        }
+        $payload['exception']['stacktrace'] = [];
+        for ($i = 1; $i <= 51; $i++) {
+            $payload['exception']['stacktrace'][] = [
+                'file' => 'app/Frame' . $i . '.php',
+                'line' => $i,
+                'function' => 'handle',
+                'in_app' => true,
+            ];
+        }
+
+        $finalised = $factory->finalise($payload);
+
+        self::assertCount(29, $finalised['tags'], 'schema 1.0 allows 29 tags; the 30th costs the whole event');
+        self::assertSame('tag-1', array_key_first($finalised['tags']),
+            'tags keep the FIRST 29 in insertion order — the server keeps the front too');
+        self::assertArrayNotHasKey('tag-30', $finalised['tags']);
+
+        self::assertCount(30, $finalised['breadcrumbs']);
+        self::assertSame('step 2', $finalised['breadcrumbs'][0],
+            'breadcrumbs keep the TAIL: it is the tail that explains the fault');
+        self::assertSame('step 31', $finalised['breadcrumbs'][29]);
+        self::assertSame(range(0, 29), array_keys($finalised['breadcrumbs']),
+            'breadcrumbs is a JSON array, so the keys have to be a list after the cut');
+
+        self::assertCount(50, $finalised['exception']['stacktrace'], 'max_frames defaults to 50');
+        self::assertSame('app/Frame1.php', $finalised['exception']['stacktrace'][0]['file'],
+            'frames keep the HEAD: the stack is most-recent-first and frame 0 is the crash site');
+        self::assertSame('app/Frame50.php', $finalised['exception']['stacktrace'][49]['file']);
+    }
 }
