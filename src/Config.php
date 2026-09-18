@@ -46,6 +46,16 @@ final class Config
         public readonly int $fingerprintCap,
         public readonly int $fingerprintWindowMs,
         public readonly array $ignoredRequestPaths,
+        /**
+         * The directory every `exception.stacktrace[].file` is sent RELATIVE to, so that no absolute path
+         * — and therefore no deployment layout, home directory or user name — leaves this process.
+         *
+         * `null` is the default and does NOT mean "off": it means DISCOVERED AT INIT, by
+         * {@see EventFactory::discoverProjectRoot()}, which is Composer's own project root. It stays null
+         * here on purpose, because a discovered absolute path is a property of the machine and not of the
+         * configuration contract — `conformance/config-defaults.json` says the same for both languages.
+         */
+        public readonly ?string $projectRoot,
     ) {
     }
 
@@ -161,6 +171,7 @@ final class Config
             ),
             ignoredRequestPaths:
                 self::listOption($options, 'ignored_request_paths', ['/api/feed/**'], $logger),
+            projectRoot: self::stringOrNull($options['project_root'] ?? null),
         );
     }
 

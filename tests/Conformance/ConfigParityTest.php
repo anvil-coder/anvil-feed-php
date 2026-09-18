@@ -270,6 +270,9 @@ final class ConfigParityTest extends TestCase
             'fingerprint_cap' => $config->fingerprintCap,
             'fingerprint_window_ms' => $config->fingerprintWindowMs,
             'ignored_request_paths' => $config->ignoredRequestPaths,
+            // null, and null is the VALUE the contract names: it means "discovered at init", and a
+            // discovered absolute path is a property of the machine rather than of the contract.
+            'project_root' => $config->projectRoot,
         ];
 
         $listed = array_keys($expected);

@@ -156,6 +156,67 @@ final class EventFactoryTest extends TestCase
         self::assertTrue(EventFactory::isInApp('C:\\proj\\src\\CheckoutService.php'));
         // "vendorish" is application code; the rule is a path segment, not a substring.
         self::assertTrue(EventFactory::isInApp('/app/vendorish/Checkout.php'));
+
+        // The path as it goes ON THE WIRE has no leading slash, so the leading segment has to count too.
+        // Without the anchor a dependency frame reads as the customer's own code, and in_app is what
+        // IncidentFingerprint.topFrames partitions on.
+        self::assertFalse(EventFactory::isInApp('/app/vendor/acme/Client.php', 'vendor/acme/Client.php'));
+        self::assertTrue(EventFactory::isInApp('/app/app/Checkout.php', 'app/Checkout.php'));
+    }
+
+    /**
+     * Finding 3 of the task-12 fix round, as the claim it is: an absolute path never leaves the process.
+     *
+     * An absolute path carries the deployment layout, the home directory and usually the user name of
+     * whoever the process runs as, into an incident a support engineer — and an agent — reads. It also
+     * makes one fault look like two files when the same service runs from two paths. The server resolves
+     * a frame against the repository (chapter 03 §4.1), so the relative path is the useful one as well as
+     * the safe one.
+     */
+    public function testAnAbsolutePathNeverLeavesTheProcess(): void
+    {
+        $frames = $this->factory()->fromThrowable(new \RuntimeException('boom'))
+            ->payload['exception']['stacktrace'];
+
+        self::assertNotSame([], $frames, 'a stack with no frames proves nothing here');
+        foreach ($frames as $frame) {
+            self::assertStringStartsNotWith('/', (string) $frame['file'], (string) $frame['file']);
+            self::assertDoesNotMatchRegularExpression(
+                '~^[A-Za-z]:[\\\\/]~',
+                (string) $frame['file'],
+                'nor a Windows drive letter: ' . $frame['file']
+            );
+        }
+    }
+
+    /** The rule itself, both branches, without a machine's layout in the expectation. */
+    public function testAFrameInsideTheProjectIsRelativeAndOneOutsideItIsABasename(): void
+    {
+        self::assertSame(
+            'app/Http/BookingController.php',
+            EventFactory::relativeTo('/srv/app', '/srv/app/app/Http/BookingController.php')
+        );
+        self::assertSame('Closure.php', EventFactory::relativeTo('/srv/app', '/tmp/Closure.php'),
+            'outside the project root: the basename, never the absolute path');
+        self::assertSame('Closure.php', EventFactory::relativeTo('', '/tmp/Closure.php'),
+            'and with no root discovered at all, the same answer rather than a leak');
+        self::assertSame('', EventFactory::relativeTo('/srv/app', ''));
+        self::assertSame('app/Checkout.php',
+            EventFactory::relativeTo('C:/proj', 'C:\\proj\\app\\Checkout.php'),
+            'separators are normalised before the root is compared');
+    }
+
+    /** Composer's project root is discovered from the autoloader, not from the working directory. */
+    public function testTheProjectRootIsDiscoveredFromComposerAndNotFromTheWorkingDirectory(): void
+    {
+        $discovered = EventFactory::normalizeRoot(EventFactory::discoverProjectRoot());
+
+        self::assertNotSame('', $discovered);
+        self::assertDirectoryExists($discovered);
+        self::assertFileExists($discovered . '/composer.json',
+            'the parent of the vendor/ that autoloaded this SDK is a Composer project');
+        self::assertStringStartsWith($discovered . '/', __FILE__,
+            'this test file lives under the root it just discovered, or the rule found the wrong one');
     }
 
     /** The same rule, reached through a real trace: PHPUnit's own frames live under vendor/. */
@@ -164,7 +225,8 @@ final class EventFactoryTest extends TestCase
         $frames = $this->factory()->fromThrowable(new \RuntimeException('boom'))->payload['exception']['stacktrace'];
         $vendor = array_values(array_filter(
             $frames,
-            static fn (array $f) => str_contains((string) $f['file'], '/vendor/')
+            static fn (array $f) => str_starts_with((string) $f['file'], 'vendor/')
+                || str_contains((string) $f['file'], '/vendor/')
         ));
 
         self::assertNotEmpty($vendor, 'this test only means something if PHPUnit frames are in the trace');

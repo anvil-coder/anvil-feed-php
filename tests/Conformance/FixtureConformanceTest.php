@@ -8,6 +8,7 @@ use AnvilFeed\AnvilFeed;
 use AnvilFeed\Client;
 use AnvilFeed\Config;
 use AnvilFeed\Event;
+use AnvilFeed\EventFactory;
 use AnvilFeed\GitContext;
 use AnvilFeed\Logger;
 use AnvilFeed\Scrubber;
@@ -139,8 +140,14 @@ final class FixtureConformanceTest extends TestCase
         // …and the two fields minimal.json leaves out are the ones this SDK always adds.
         self::assertSame("Cannot read property 'id' of undefined", $full['exception']['message']);
         self::assertNotSame([], $full['exception']['stacktrace']);
-        // The throw site is where the caller raised it, which for an exception is this very line.
-        self::assertSame(__FILE__, $full['exception']['stacktrace'][0]['file']);
+        // The throw site is where the caller raised it, which for an exception is this very line — sent
+        // RELATIVE to the project root, because an absolute path carries a machine's layout into an
+        // incident somebody else reads.
+        self::assertSame(
+            EventFactory::relativeTo(EventFactory::normalizeRoot(EventFactory::discoverProjectRoot()), __FILE__),
+            $full['exception']['stacktrace'][0]['file']
+        );
+        self::assertStringStartsNotWith('/', $full['exception']['stacktrace'][0]['file']);
     }
 
     /**
@@ -670,20 +677,21 @@ final class FixtureConformanceTest extends TestCase
      */
     private function asAGoldenDocument(array $actual, array $expected): array
     {
-        $root = realpath(self::REPOSITORY);
-        self::assertIsString($root);
-
         $frames = $actual['exception']['stacktrace'] ?? [];
         self::assertIsArray($frames);
         self::assertCount(1, $frames, 'the golden client asks for one frame, so the fixture can carry it');
 
-        foreach ($frames as $index => $frame) {
+        // Nothing is normalised here any more. The SDK itself sends the path relative to `project_root`
+        // (task 12 fix round, finding 3), the golden client points that knob at the repository root, and
+        // so the document below IS what left the process. What this asserts is that the claim holds: a
+        // frame that arrived absolute would mean the knob stopped being honoured, and normalising it back
+        // into agreement is exactly how that defect would go unnoticed.
+        foreach ($frames as $frame) {
             $file = (string) ($frame['file'] ?? '');
-            self::assertStringStartsWith($root . '/', $file,
-                'the frame is not in this repository, so normalising it would hide what it really is');
-            $frames[$index]['file'] = substr($file, strlen($root) + 1);
+            self::assertStringStartsNotWith('/', $file,
+                'an absolute path never leaves the process; project_root is what it is cut against');
+            self::assertStringNotContainsString(':\\', $file, 'nor a Windows drive letter');
         }
-        $actual['exception']['stacktrace'] = $frames;
 
         return $this->substituteTheUnequalFields($actual, $expected);
     }
@@ -695,7 +703,10 @@ final class FixtureConformanceTest extends TestCase
      */
     private function goldenClient(): Client
     {
-        return $this->client(['max_frames' => 1]);
+        // project_root is the REPOSITORY root here, not Composer's `php/`: the two golden fixtures carry a
+        // repository-relative frame, and pointing the knob at the root the fixture was written against is
+        // what lets the document be compared to the SDK's output with nothing normalised away afterwards.
+        return $this->client(['max_frames' => 1, 'project_root' => realpath(self::REPOSITORY)]);
     }
 
     /** @return list<array<string, mixed>> */

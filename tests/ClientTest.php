@@ -378,7 +378,14 @@ final class ClientTest extends TestCase
         $frames = $client->queue()->take(1)[0]->payload['exception']['stacktrace'];
 
         self::assertNotSame([], $frames);
-        self::assertSame(__FILE__, $frames[0]['file'], 'the stack starts where the caller called');
+        // The path as it goes on the wire: RELATIVE to the project root, never absolute. Composing the
+        // expectation from the rule rather than pinning a string keeps this true on every checkout.
+        self::assertSame(
+            EventFactory::relativeTo(EventFactory::normalizeRoot(EventFactory::discoverProjectRoot()), __FILE__),
+            $frames[0]['file'],
+            'the stack starts where the caller called'
+        );
+        self::assertStringStartsNotWith('/', $frames[0]['file'], 'an absolute path never leaves the process');
         $ours = dirname(__DIR__) . DIRECTORY_SEPARATOR . 'src' . DIRECTORY_SEPARATOR;
         foreach ($frames as $frame) {
             self::assertStringNotContainsString($ours, $frame['file'],
@@ -406,7 +413,11 @@ final class ClientTest extends TestCase
         $client->captureTestEvent();
         $frames = $client->queue()->take(1)[0]->payload['exception']['stacktrace'];
 
-        self::assertSame(__FILE__, $frames[0]['file']);
+        self::assertSame(
+            EventFactory::relativeTo(EventFactory::normalizeRoot(EventFactory::discoverProjectRoot()), __FILE__),
+            $frames[0]['file']
+        );
+        self::assertStringStartsNotWith('/', $frames[0]['file'], 'an absolute path never leaves the process');
     }
 
     /**

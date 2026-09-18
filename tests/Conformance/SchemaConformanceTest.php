@@ -214,7 +214,9 @@ final class SchemaConformanceTest extends TestCase
             $wire = $this->overTheWire($this->factory()->fromThrowable($error));
 
             self::assertSame([], $this->validator()->errors($wire));
-            self::assertSame($probe, $wire->exception->stacktrace[0]->file);
+            // The probe lives in the temp directory, i.e. OUTSIDE the project root: the wire then carries
+            // the basename and never the absolute path (task 12 fix round, finding 3).
+            self::assertSame(basename($probe), $wire->exception->stacktrace[0]->file);
             self::assertGreaterThan(
                 900,
                 mb_strlen($wire->exception->stacktrace[0]->context_code),

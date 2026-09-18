@@ -54,7 +54,12 @@ final class EventFactory
         private readonly string $sdkVersion = self::SDK_VERSION,
         private readonly string $language = 'php',
     ) {
+        // Resolved ONCE, at init: a discovery per frame would probe the filesystem on the capture path.
+        $this->projectRoot = self::normalizeRoot($config->projectRoot ?? self::discoverProjectRoot());
     }
+
+    /** The resolved {@see Config::$projectRoot}: no trailing slash, forward slashes, possibly empty. */
+    private readonly string $projectRoot;
 
     /** @param array<string, mixed> $context */
     public function fromThrowable(\Throwable $error, string $level = 'error', array $context = []): Event
@@ -415,8 +420,11 @@ final class EventFactory
     /** @return array<string, mixed> */
     private function frame(string $file, int $line, string $function): array
     {
-        $frame = ['file' => $file, 'line' => max(0, $line), 'function' => $function];
-        $frame['in_app'] = self::isInApp($file);
+        // What goes on the wire is the path RELATIVE to the project root; what the source is read from is
+        // the absolute one. The two are not interchangeable and this is the only place both are in hand.
+        $relative = self::relativeTo($this->projectRoot, $file);
+        $frame = ['file' => $relative, 'line' => max(0, $line), 'function' => $function];
+        $frame['in_app'] = self::isInApp($file, $relative);
         // in_app frames only: a vendor frame's source lines cost a file read per frame in the request path
         // (measured 12.4 ms for ten captures, task-5 review) and tell a repair agent nothing it can change.
         $context = $frame['in_app'] ? $this->contextCode($file, $line) : null;
@@ -534,13 +542,78 @@ final class EventFactory
      * production and open a second incident for it. Public because it is a rule worth testing directly and
      * the Laravel adapter needs the same answer.
      */
-    public static function isInApp(string $file): bool
+    public static function isInApp(string $file, ?string $relative = null): bool
     {
         if ($file === '' || self::isOurOwn($file)) {
             return false;   // this SDK is never the customer's own code, wherever it is installed
         }
+        // The vendor rule is applied to the path as it goes ON THE WIRE, which is relative to the project
+        // root — so the leading segment has to count. `vendor/acme/Client.php` has no separator in front
+        // of it and is exactly the shape every dependency frame now has; the old pattern read it as the
+        // customer's own code, and in_app is what IncidentFingerprint.topFrames partitions on. Java's
+        // EventFactory.VENDOR carries the same anchor for the same reason.
+        return preg_match('~(^|[\\\\/])vendor[\\\\/]~', $relative ?? $file) !== 1;
+    }
 
-        return preg_match('~[\\\\/]vendor[\\\\/]~', $file) !== 1;
+    /**
+     * Composer's own project root: the parent of the `vendor/` directory that autoloaded this class.
+     *
+     * Read from the autoloader rather than from `getcwd()`, because a queue worker, a cron entry and an
+     * artisan command all run with different working directories and the answer has to be the same in all
+     * three — `exception.stacktrace[].file` is what the ingest resolves against the repository
+     * (chapter 03 §4.1), so a root that moved with the process would make one fault look like two files.
+     */
+    public static function discoverProjectRoot(): string
+    {
+        if (class_exists(\Composer\Autoload\ClassLoader::class, false)) {
+            $loader = (new \ReflectionClass(\Composer\Autoload\ClassLoader::class))->getFileName();
+            if (is_string($loader) && $loader !== '') {
+                return dirname($loader, 3);   // vendor/composer/ClassLoader.php → the project root
+            }
+        }
+        // No Composer in the process (a phar, a hand-rolled autoloader): the nearest ancestor of this file
+        // that holds a composer.json.
+        $directory = __DIR__;
+        for ($level = 0; $level < 8; $level++) {
+            $parent = dirname($directory);
+            if ($parent === $directory) {
+                break;
+            }
+            $directory = $parent;
+            if (is_file($directory . '/composer.json')) {
+                return $directory;
+            }
+        }
+
+        return getcwd() ?: '';
+    }
+
+    /** Forward slashes, no trailing slash. An empty root means "nothing can be made relative". */
+    public static function normalizeRoot(string $root): string
+    {
+        return rtrim(str_replace('\\', '/', $root), '/');
+    }
+
+    /**
+     * The path as it goes on the wire.
+     *
+     * Inside the root: the path with the root removed. Outside it — a framework installed globally, a
+     * PHP file in /tmp, an eval'd closure — the BASENAME, never the absolute path: an absolute path
+     * carries the deployment layout, the home directory and usually the user name of whoever the process
+     * runs as, into an incident a support engineer reads. Java's half of this rule sends the file NAME for
+     * the same frames, because a StackTraceElement has nothing else to give.
+     */
+    public static function relativeTo(string $projectRoot, string $file): string
+    {
+        if ($file === '') {
+            return '';
+        }
+        $normalized = str_replace('\\', '/', $file);
+        if ($projectRoot !== '' && str_starts_with($normalized, $projectRoot . '/')) {
+            return substr($normalized, strlen($projectRoot) + 1);
+        }
+
+        return basename($normalized);
     }
 
     /**
