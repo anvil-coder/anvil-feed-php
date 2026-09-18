@@ -168,13 +168,19 @@ final class LoopGuardTest extends TestCase
      * And the newcomers there was no room to track are capped too, against a shared window. Letting one
      * through because the table is full would be an uncapped storm on the one path that exists to cap
      * storms.
+     *
+     * The bucket's count and a fingerprint's own count are two different facts, and they are two
+     * different questions. `suppressed()` used to fall back to the bucket for every fingerprint it did
+     * not track apart, so a caller asking about one that had never been suppressed at all was answered
+     * with somebody else's storm (Java's task-8 review finding 4). This test therefore pins both halves:
+     * zero for the untracked fingerprint, and the drops still countable by name.
      */
     public function testAFingerprintTheTableHasNoRoomForIsStillCapped(): void
     {
         $now = 1000.0;
         $gate = new RateGate(3, 60000, function () use (&$now) { return $now; });
         for ($i = 0; $i < 600; $i++) {
-            $gate->allow('live-' . $i);
+            $gate->allow('live-' . $i);   // the table fills and stays live
         }
 
         $allowed = 0;
@@ -183,8 +189,12 @@ final class LoopGuardTest extends TestCase
         }
 
         self::assertLessThanOrEqual(3, $allowed, 'the overflow bucket caps them together');
-        self::assertGreaterThan(0, $gate->suppressed('newcomer-49'),
-            'and the drop is countable, so the storm can still be said once');
+        self::assertSame(0, $gate->suppressed('newcomer-0'),
+            'a fingerprint the table never tracked has no count of its own — the bucket\'s count is the '
+            . 'bucket\'s, and answering with it would name a storm about a fingerprint that was never '
+            . 'suppressed apart');
+        self::assertGreaterThan(0, $gate->suppressedOverflow(),
+            'and the drops are countable by name, so an overflowed storm can still be said');
     }
 
     /** An expired entry is capping nothing, so it is the one that makes room — and the table stays bounded. */

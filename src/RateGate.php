@@ -77,17 +77,24 @@ final class RateGate
     }
 
     /**
-     * How many events the current window has dropped for that fingerprint — and, for one the table had
-     * no room for, how many the overflow bucket it was counted against has dropped. Zero for a
-     * fingerprint that has not been seen. The caller uses `1` as the edge that says the line about the
-     * storm once per window.
+     * How many events the current window has dropped FOR THAT FINGERPRINT. Zero for one that is not
+     * tracked apart — never seen, expired and evicted, or counted against the shared bucket; ask
+     * `suppressedOverflow()` for that one.
+     *
+     * It used to fall back to the overflow bucket, and then the sentence "zero for a fingerprint that has
+     * not been seen" was untrue the moment the bucket was non-empty: a caller could be told a storm about
+     * a fingerprint that had never been suppressed at all, and the client's storm line named it. The two
+     * counters are two different facts and are now two different questions (Java's task-8 review
+     * finding 4; the Java twin's `suppressed`/`suppressedOverflow` pair, rule for rule).
      */
     public function suppressed(string $fingerprint): int
     {
-        if (isset($this->windows[$fingerprint])) {
-            return $this->windows[$fingerprint]['suppressed'];
-        }
+        return $this->windows[$fingerprint]['suppressed'] ?? 0;
+    }
 
+    /** How many events the SHARED bucket has dropped in its current window — the ones nothing tracked. */
+    public function suppressedOverflow(): int
+    {
         return $this->overflow['suppressed'] ?? 0;
     }
 
