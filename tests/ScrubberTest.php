@@ -283,4 +283,59 @@ final class ScrubberTest extends TestCase
         self::assertSame('https://[Filtered]@app.example/reset?token=[Filtered]&user=7#section-2', $once);
         self::assertSame($once, $scrubber->scrubUrl($once), 'the second pass changed an already scrubbed URL');
     }
+
+    /**
+     * An EMPTY denylist is a configuration, not a mistake: the operator asked for no key-based redaction
+     * and has to get none. What it must never become is an empty alternation — `/\b()\b(\s*[:=]\s*)…/`
+     * matches at every colon and every equals sign in every text the SDK touches, so `user=alice&mode=fast`
+     * came back as `user=[Filtered]&mode=[Filtered]`: every readable value in the payload destroyed by the
+     * one configuration whose whole point was to keep them. The Java core compiles no key pattern at all
+     * for an empty list (task-6 review finding 7); this is the same behaviour, C9/C17.
+     */
+    public function testAnEmptyDenylistMeansNoKeyRuleAtAll(): void
+    {
+        $scrubber = new Scrubber([]);
+
+        self::assertSame(
+            'user=alice&mode=fast',
+            $scrubber->scrubText('user=alice&mode=fast'),
+            'an empty denylist filtered a key it was never given'
+        );
+        self::assertSame(
+            'token=abc123',
+            $scrubber->scrubText('token=abc123'),
+            'with no denylist even a term from the DEFAULT list is only a word'
+        );
+        self::assertSame(
+            ['token' => 'abc123', 'note' => 'password: hunter2'],
+            $scrubber->scrub(['token' => 'abc123', 'note' => 'password: hunter2'])
+        );
+        self::assertSame(
+            'https://app.example/reset?token=abc123&user=7',
+            $scrubber->scrubUrl('https://app.example/reset?token=abc123&user=7')
+        );
+    }
+
+    /**
+     * The other half of the same promise: the absolutes are not the denylist and do not go quiet with it.
+     * Bearer keeps its scheme and loses its value, URL userinfo keeps its shape and loses the credential,
+     * and user.ip / user.ip_hash are removed outright — FR-5 c, whatever the denylist says.
+     */
+    public function testTheAbsolutesStillRunWhenTheDenylistIsEmpty(): void
+    {
+        $scrubber = new Scrubber([]);
+
+        self::assertSame(
+            'Authorization: Bearer [Filtered]',
+            $scrubber->scrubText('Authorization: Bearer sk-live-99887766')
+        );
+        self::assertSame(
+            'https://[Filtered]@app.example/reset',
+            $scrubber->scrubUrl('https://admin:hunter2@app.example/reset')
+        );
+        self::assertSame(
+            ['user' => ['id' => 'u-1']],
+            $scrubber->scrub(['user' => ['id' => 'u-1', 'ip' => '10.0.0.1', 'ip_hash' => 'sha256:abc']])
+        );
+    }
 }

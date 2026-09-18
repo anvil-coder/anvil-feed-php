@@ -24,7 +24,8 @@ final class Scrubber
 {
     public const FILTERED = '[Filtered]';
 
-    private readonly string $textPattern;
+    /** null when the denylist is empty: no key rule at all, rather than one that matches everywhere. */
+    private readonly ?string $textPattern;
     /** @var list<string> */
     private readonly array $normalizedTerms;
 
@@ -43,6 +44,20 @@ final class Scrubber
             static fn (string $term) => preg_replace('/[^a-z0-9]/', '', $term) ?? $term,
             $terms
         );
+
+        if ($terms === []) {
+            // An EMPTY denylist is a configuration, not a mistake (FR-5 a): the operator asked for no
+            // key-based redaction and gets none. What it must NOT become is an empty alternation —
+            // `/\b()\b(\s*[:=]\s*)…/` matches at every colon and every equals sign in every text this
+            // SDK touches, so `user=alice&mode=fast` came back as `user=[Filtered]&mode=[Filtered]`: every
+            // readable value destroyed by the one setting whose whole point was to keep them. The Bearer
+            // pass, the URL rules and the user.ip removal are absolutes and keep running. This is the Java
+            // core's behaviour (AnvilFeedConfig/Scrubber, task-6 review finding 7), and C9/C17 require the
+            // two languages to answer the same here.
+            $this->textPattern = null;
+
+            return;
+        }
 
         // "api_key" also matches "api-key", "apiKey" and "API KEY"; "credit_card" likewise.
         $alternatives = implode('|', array_map(
@@ -91,6 +106,10 @@ final class Scrubber
     {
         // The scheme survives; the value does not.
         $text = preg_replace('/\bBearer\s+[A-Za-z0-9._~+\/=-]{3,}/i', 'Bearer ' . self::FILTERED, $text) ?? $text;
+
+        if ($this->textPattern === null) {
+            return $text;   // an honoured empty denylist: no key rule, the absolutes above still ran
+        }
 
         return preg_replace_callback(
             $this->textPattern,
