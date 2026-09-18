@@ -122,6 +122,21 @@ final class Client
      * The hook of FR-5 and the escape hatch for anything this SDK cannot know about. It receives the fully
      * built, already scrubbed payload and returns a payload or null to drop the event.
      *
+     * <p>What the hook cannot do, and what happens when it tries (task-3 review, findings 3 and 4):
+     * <ul>
+     *   <li>The identity fields — {@code event_id}, {@code timestamp}, {@code sdk}, {@code service},
+     *       {@code environment} and the fingerprint inputs — are read-only: a changed value is restored to
+     *       the original and logged once. A rewritten id would desync the server's delivery key.</li>
+     *   <li>The returned payload goes through scrub → bounds → prune AGAIN before it is queued, so a hook
+     *       cannot put PII or an over-cap value on the wire (FR-5 is SDK-side, the server is a backstop).</li>
+     *   <li>A hook that THROWS costs the modification, not the event: the exception is logged once and the
+     *       unmodified event is sent (FR-2 — host code cannot take the host down through us).</li>
+     *   <li>A hook that RETURNS a payload the schema cannot accept (a required field removed, say) drops
+     *       the event locally with one log line. That is deliberate and stricter than sending: the ingest
+     *       would answer 400, which the retry rules never retry, so the event would be lost either way —
+     *       this way the loss is named in the host's own log.</li>
+     * </ul>
+     *
      * @param null|callable(array<string, mixed>): ?array<string, mixed> $hook
      */
     public function beforeSend(?callable $hook): void
