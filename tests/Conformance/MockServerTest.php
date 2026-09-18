@@ -154,6 +154,15 @@ final class MockServerTest extends TestCase
                     (string) $entry['file'] . ': the pause is exactly Retry-After');
                 break;
 
+            case 'backoff':
+                self::assertSame($events, $this->queueCount(), (string) $entry['file']
+                    . ': the events are KEPT — this is the environment C11/C15 exist for');
+                self::assertGreaterThan($this->now, (float) $this->client?->sender()->pausedUntil(),
+                    (string) $entry['file'] . ': a backoff was armed');
+                self::assertLessThan($this->now + 1.2, (float) $this->client?->sender()->pausedUntil(),
+                    (string) $entry['file'] . ': the first backoff, jittered around one second');
+                break;
+
             default:
                 self::fail('unknown retry verdict ' . var_export($entry['retry'], true));
         }

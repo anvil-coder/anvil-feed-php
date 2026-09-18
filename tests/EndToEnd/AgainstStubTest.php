@@ -731,6 +731,30 @@ final class AgainstStubTest extends TestCase
         self::assertStringContainsString('canonical UUID', $body['rejected'][0]['message']);
     }
 
+    /**
+     * Review finding 7. `AnvilFeedEventMapper.majorIsSupported` parses the major with
+     * `Integer.parseInt`, which THROWS on trailing garbage, so `"1abc"` is
+     * `unsupported_schema_version` at the running ingest. The stub read it with `Number.parseInt`,
+     * which reads the `1` and stops, and answered 202 — the one branch on which this replay was looser
+     * than the server it replays. No SDK sends anything but `"1.0"`, so nothing shipped depended on it;
+     * "rule for rule" is the stub's own claim about itself.
+     */
+    public function testASchemaVersionWithATrailingGarbageMajorIsRefusedLikeTheMapperRefusesIt(): void
+    {
+        $event = json_decode(
+            (string) file_get_contents(self::ROOT . '/conformance/valid/minimal.json'),
+            true
+        );
+        $event['schema_version'] = '1abc';
+
+        $answer = $this->post('/raw/accepted/api/feed/events', (string) json_encode($event));
+        $body = json_decode($answer['body'], true);
+
+        self::assertSame(202, $answer['status']);
+        self::assertSame([], $body['accepted']);
+        self::assertSame('unsupported_schema_version', $body['rejected'][0]['reason_code']);
+    }
+
     /** Disabled is the fourth verdict, and it reaches no socket at all. */
     public function testADisabledSdkSendsNothing(): void
     {

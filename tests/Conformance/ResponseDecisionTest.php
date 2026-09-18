@@ -106,6 +106,17 @@ final class ResponseDecisionTest extends TestCase
                     $entry['file'] . ': the pause is exactly Retry-After');
                 break;
 
+            case 'backoff':
+                self::assertSame(2, $queue->count(), $entry['file']
+                    . ': the events are KEPT — a proxy whose credentials are fixed five minutes later '
+                    . 'must cost nothing');
+                self::assertGreaterThan($this->now, $sender->pausedUntil(), $entry['file']
+                    . ': a backoff was armed');
+                self::assertLessThan($this->now + 1.2, $sender->pausedUntil(), $entry['file']
+                    . ': the FIRST backoff, jittered around one second — not a Retry-After and not a '
+                    . 'pause of the sender\'s own choosing');
+                break;
+
             default:
                 self::fail('unknown retry verdict ' . var_export($entry['retry'], true));
         }
