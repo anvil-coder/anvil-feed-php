@@ -49,6 +49,9 @@ final class AgainstStubTest extends TestCase
      */
     private const CROSS_LANGUAGE_RUN = 'c9';
 
+    /** The message BOTH SDKs throw, so that `exception.message` can be compared rather than masked. */
+    public const CROSS_LANGUAGE_MESSAGE = 'Cannot read property id of undefined';
+
     /** The context both SDKs capture with, so that the two wire bodies can be compared field for field. */
     public const CROSS_LANGUAGE_CONTEXT = [
         'request' => ['method' => 'POST', 'url' => 'https://shop.example/api/checkout', 'status_code' => 500],
@@ -82,7 +85,13 @@ final class AgainstStubTest extends TestCase
             $descriptors,
             $pipes,
             null,
-            ['STUB_JOURNAL' => self::$journal, 'PATH' => getenv('PATH') ?: '/usr/bin:/bin:/usr/local/bin']
+            [
+                'STUB_JOURNAL' => self::$journal,
+                // `testing` is a binding the operator switched OFF: one of the four answers a first
+                // integration meets, and the only one no other scenario can produce.
+                'STUB_DISABLED_ENVIRONMENTS' => 'testing',
+                'PATH' => getenv('PATH') ?: '/usr/bin:/bin:/usr/local/bin',
+            ]
         );
         if (!is_resource($process)) {
             self::fail('the ingest stub could not be started. Node 22+ has to be on PATH; see '
@@ -93,6 +102,10 @@ final class AgainstStubTest extends TestCase
         $listening = fgets($pipes[1]);
         if (!is_string($listening) || preg_match('/listening (\d+)/', $listening, $matches) !== 1) {
             $stderr = stream_get_contents($pipes[2]);
+            // tearDownAfterClass does NOT run when setUpBeforeClass fails, so the node process this
+            // method started would outlive the suite — holding a port, appending to a journal a later run
+            // then reads, and staying alive until somebody notices. Kill it before failing.
+            self::stopTheStub();
             self::fail('the ingest stub did not report a port. stdout: ' . var_export($listening, true)
                 . ' stderr: ' . var_export($stderr, true));
         }
@@ -101,6 +114,12 @@ final class AgainstStubTest extends TestCase
     }
 
     public static function tearDownAfterClass(): void
+    {
+        self::stopTheStub();
+    }
+
+    /** Idempotent, and called from setUpBeforeClass's failure path too — see the comment there. */
+    private static function stopTheStub(): void
     {
         if (is_resource(self::$process)) {
             proc_terminate(self::$process);
@@ -314,7 +333,7 @@ final class AgainstStubTest extends TestCase
         $client = $this->install(self::CROSS_LANGUAGE_RUN);
 
         $id = AnvilFeed::captureException(
-            new \RuntimeException('Cannot read property id of undefined'),
+            new \RuntimeException(self::CROSS_LANGUAGE_MESSAGE),
             self::CROSS_LANGUAGE_CONTEXT
         );
         self::assertNotNull($id);
@@ -344,6 +363,8 @@ final class AgainstStubTest extends TestCase
         self::assertSame(['id' => 'u-4711'], $body['user']);
         self::assertSame(['cart.add sku=A1', 'checkout.start'], $body['breadcrumbs']);
         self::assertSame(['tier' => 'gold'], $body['tags']);
+        self::assertSame(self::CROSS_LANGUAGE_MESSAGE, $body['exception']['message'],
+            'the message is what compare.mjs holds the two SDKs to; the type and the frames it cannot');
         self::assertSame(0, $client->queue()->count(), 'an accepted event is cleared');
         self::assertFalse($client->sender()->isStopped());
     }
@@ -454,8 +475,8 @@ final class AgainstStubTest extends TestCase
         $resumed = $this->journal('ratelimit');
         self::assertCount(2, $resumed, 'at the deadline the send resumes');
         self::assertSame(202, $resumed[1]['status']);
-        // Measured against the STUB's own timestamps, not against the injected clock alone.
-        self::assertGreaterThanOrEqual($entries[0]['at'], $resumed[1]['at']);
+        // The proof is the COUNT after +59 s, not a wall-clock stamp: the stub's `at` is real time and the
+        // SDK's clock is injected, so comparing them would assert that this machine's clock runs forwards.
     }
 
     /**
@@ -472,7 +493,12 @@ final class AgainstStubTest extends TestCase
         $entries = $this->journal('unauthorized');
         self::assertCount(1, $entries);
         self::assertSame(401, $entries[0]['status']);
-        self::assertNull($entries[0]['body'], 'a 401 is bare — the body is never parsed');
+        self::assertSame(
+            'Bearer anv_srv_… (17 characters)',
+            $entries[0]['headers']['authorization'],
+            'the SDK presented the token it was configured with; the 401 was EARNED by that token and not '
+                . 'by a request the ingest could not read'
+        );
         self::assertTrue($client->sender()->isStopped());
         self::assertSame(0, $client->queue()->count(), 'the queue is drained, not retried');
 
@@ -605,6 +631,104 @@ final class AgainstStubTest extends TestCase
 
         AnvilFeed::flush();
         self::assertCount(1, $this->journal('nobinding'), 'a 4xx-equivalent verdict is never retried');
+    }
+
+    /**
+     * A binding that exists and is switched off. It is the third of the four verdicts a first integration
+     * meets, it is FINAL — the event is not resent — and it is the one an SDK is most tempted to retry,
+     * because a 202 with an empty `accepted` list looks like nothing happened.
+     */
+    public function testADisabledBindingIsFinalAndTheEventIsNotResent(): void
+    {
+        $client = $this->install('bindingdisabled', 'accepted', ['environment' => 'testing']);
+
+        AnvilFeed::captureTestEvent();
+        AnvilFeed::flush();
+
+        $entries = $this->journal('bindingdisabled');
+        self::assertCount(1, $entries);
+        self::assertSame('binding_disabled', $entries[0]['response']['rejected'][0]['reason_code']);
+        self::assertSame(0, $client->queue()->count());
+        self::assertFalse($client->sender()->isStopped());
+
+        AnvilFeed::flush();
+        self::assertCount(1, $this->journal('bindingdisabled'));
+    }
+
+    /**
+     * A server that answers the status line and then withholds the body past any sane request budget. The
+     * event is KEPT — a read timeout is transient and the batch has not been refused — the sender is not
+     * stopped, and the whole flush returns long before the stub would have finished.
+     *
+     * The elapsed time is measured rather than slept through: the assertion is that the budget reached the
+     * socket, and a flush that took the stub's five seconds would fail it.
+     */
+    public function testASlowIngestIsATransientFailureBoundedByTheConfiguredBudget(): void
+    {
+        $client = $this->install('slowingest', 'slow', [
+            'request_timeout_ms' => 300,
+            'connect_timeout_ms' => 300,
+        ]);
+
+        AnvilFeed::captureException(new \RuntimeException('a fault behind a slow ingest'));
+        $startedAt = microtime(true);
+        AnvilFeed::flush();
+        $elapsedMs = (microtime(true) - $startedAt) * 1000;
+
+        self::assertCount(1, $this->journal('slowingest'), 'the request did reach the stub');
+        self::assertLessThan(3000, $elapsedMs,
+            'the 300 ms budget has to reach the socket; the stub withholds the body for five seconds');
+        self::assertSame(1, $client->queue()->count(), 'a read timeout is transient, not a refusal');
+        self::assertFalse($client->sender()->isStopped());
+        self::assertNotEmpty($this->written->matching('transport failure'));
+    }
+
+    /**
+     * The two long-window answers of `conformance/responses/index.json`. 137 and 900 are deliberately not
+     * the documented 60 and 30: an SDK that lost the `Retry-After` header and fell back to its own
+     * constant is indistinguishable from one that read it, for as long as every answer carries the
+     * default.
+     */
+    public function testThePauseIsTheRetryAfterTheServerSentAndNotAConstantTheSdkKnows(): void
+    {
+        $this->script('longwindow', 'rate-limited-long-window');
+        $client = $this->install('longwindow');
+        AnvilFeed::captureException(new \RuntimeException('a fault during a long rate-limit window'));
+        AnvilFeed::flush();
+
+        self::assertSame('137', $this->journal('longwindow')[0]['retry_after']);
+        self::assertSame($this->now + 137.0, $client->sender()->pausedUntil());
+
+        $this->script('longwindow2', 'transient-long-window');
+        $client = $this->install('longwindow2');
+        AnvilFeed::captureException(new \LogicException('a fault during a long maintenance window'));
+        AnvilFeed::flush();
+
+        self::assertSame('900', $this->journal('longwindow2')[0]['retry_after']);
+        self::assertSame($this->now + 900.0, $client->sender()->pausedUntil());
+        self::assertSame(1, $client->queue()->count(), 'a 503 keeps the whole batch');
+    }
+
+    /**
+     * The mapper trims nothing: a padded id reaches `UUID.fromString` with its padding
+     * (AnvilFeedEventMapper.java:97-114). A stub that trimmed first would answer 202 to a body the running
+     * ingest refuses per event — which is the proxy this whole task exists to make expensive.
+     */
+    public function testAPaddedEventIdIsRefusedBecauseTheMapperTrimsNothing(): void
+    {
+        $event = json_decode(
+            (string) file_get_contents(self::ROOT . '/conformance/valid/minimal.json'),
+            true
+        );
+        $event['event_id'] = '  ' . $event['event_id'] . '  ';
+
+        $answer = $this->post('/raw/accepted/api/feed/events', (string) json_encode($event));
+        $body = json_decode($answer['body'], true);
+
+        self::assertSame(202, $answer['status']);
+        self::assertSame([], $body['accepted']);
+        self::assertSame('schema_violation', $body['rejected'][0]['reason_code']);
+        self::assertStringContainsString('canonical UUID', $body['rejected'][0]['message']);
     }
 
     /** Disabled is the fourth verdict, and it reaches no socket at all. */
