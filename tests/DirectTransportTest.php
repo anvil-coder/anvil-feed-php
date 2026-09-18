@@ -266,6 +266,22 @@ final class DirectTransportTest extends TestCase
             . 'default; a 0 would turn a rate limit into a hot loop');
     }
 
+    /**
+     * Review finding 8. `(int) '99999999999999999999'` saturates to PHP_INT_MAX, and `Sender::pause`
+     * would then set `pausedUntil` past the heat death of the universe: a long-lived worker behind a
+     * buggy proxy is muted for its whole life, with one "paused for …s" line to show for it. Nine digits
+     * is thirty-one years and is the same cap `HttpTransport.retryAfter` applies.
+     */
+    #[\PHPUnit\Framework\Attributes\DataProvider('bothPaths')]
+    public function testARetryAfterOfTwentyDigitsIsNullRatherThanForEver(bool $useCurl): void
+    {
+        $response = $this->transport($useCurl)->post(self::$base . '/absurd-retry-after', '{}');
+
+        self::assertSame(429, $response->status);
+        self::assertNull($response->retryAfterSeconds,
+            'the sender falls back to its documented 60 s rather than pausing for ever');
+    }
+
     #[\PHPUnit\Framework\Attributes\DataProvider('bothPaths')]
     public function testAnUnreachableIngestIsATransportFailureAndNeverAnException(bool $useCurl): void
     {

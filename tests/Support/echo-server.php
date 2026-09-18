@@ -12,6 +12,7 @@ declare(strict_types=1);
  * /api/feed/events/batch  the same
  * /rate-limited           429 with `Retry-After: 60` and no body, exactly as the ingest answers
  * /no-retry-after         429 with no Retry-After at all
+ * /absurd-retry-after     429 with a twenty-digit Retry-After — a buggy proxy, not a window
  * /redirect?marker=…      302 to /elsewhere with the same marker — the credential-leak case
  * /elsewhere?marker=…     writes a marker file, so a test can prove the redirect was NOT followed
  * /dribble                headers, then one byte every 100 ms for three seconds — the hung-server case
@@ -64,6 +65,13 @@ if ($path === '/rate-limited') {
 }
 if ($path === '/no-retry-after') {
     http_response_code(429);
+
+    return true;
+}
+// Twenty digits. `(int)` saturates that to PHP_INT_MAX seconds, which is a mute worker rather than a
+// pause — see Response::retryAfterSeconds (review finding 8).
+if ($path === '/absurd-retry-after') {
+    header('Retry-After: 99999999999999999999', true, 429);
 
     return true;
 }

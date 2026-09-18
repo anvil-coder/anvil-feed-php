@@ -22,6 +22,8 @@ use AnvilFeed\Transport\Transport;
  *   429  pause for exactly Retry-After. Keep the events. Never drop for it.
  *   503  repeat the WHOLE batch after Retry-After. The delivery key is (organisation, event_id), so a
  *        repeat of events that already landed is counted once.
+ *   407  the PROXY refused, not the ingest. Its own line, said once, naming the proxy; then treated as a
+ *        transport failure — backoff, events stay queued. Never "an unexpected status" (C16).
  *   5xx / timeout / DNS  exponential backoff with jitter, capped; the events stay in the queue.
  *
  * Nothing here throws. Every public method is total (FR-2 b): a transport that throws in breach of its own
@@ -38,6 +40,20 @@ final class Sender
     private const DEFAULT_RATE_LIMIT_PAUSE_SECONDS = 60;
     /** …and `Retry-After: 30` with every 503. */
     private const DEFAULT_TRANSIENT_PAUSE_SECONDS = 30;
+
+    /**
+     * The documented floor below which no request is issued at all (review finding 9; Java's
+     * `Sender.MINIMUM_REQUEST_BUDGET_MS`). With a handful of milliseconds left nothing but a local
+     * failure is possible, and that failure would be indistinguishable from a real one:
+     * $consecutiveFailures would climb and a ~1 s backoff would be armed at the end of EVERY flush that
+     * drains a deep queue — the ordinary case after an outage, which is precisely FR-3 (a)'s scenario,
+     * and on a queue worker or under Octane this sender's state survives the request that armed it.
+     *
+     * 50 ms, not connect_timeout_ms: at its default of 1 s that would leave up to half of every 2 s
+     * flush unusable, trading one slow recovery for another. The batch is requeued and the next flush
+     * takes it. Not attempted is not failed.
+     */
+    private const MINIMUM_REQUEST_BUDGET_MS = 50;
 
     /**
      * "Once per process" (ruling P3) lives HERE and not in the Logger: Logger::once() is per instance, so
@@ -147,11 +163,20 @@ final class Sender
             return $this->splitAndSend($batch);
         }
 
+        // Below the floor nothing but a local failure is possible, and a local failure here would arm a
+        // backoff the network never earned (finding 9). Not attempted is not failed.
+        $budgetMs = $this->remainingBudgetMs();
+        if ($budgetMs < self::MINIMUM_REQUEST_BUDGET_MS) {
+            $this->queue->unshiftAll($batch);
+
+            return false;
+        }
+
         try {
             $response = $this->transport->post(
                 count($batch) === 1 ? $this->config->eventsUrl() : $this->config->batchUrl(),
                 $body,
-                $this->remainingBudgetMs()
+                $budgetMs
             );
         } catch (\Throwable $never) {
             // A Transport is contractually not allowed to throw. If one does, it is treated as a
@@ -276,6 +301,7 @@ final class Sender
             $response->status === 503 => $this->pause($batch, $now,
                 $response->retryAfterSeconds ?? self::DEFAULT_TRANSIENT_PAUSE_SECONDS,
                 'transient store failure; the whole batch is repeated'),
+            $response->status === 407 => $this->proxyRefused($batch, $now, $response),
             $response->status >= 500 => $this->backOff($batch, $now, 'the ingest answered '
                 . $response->status),
             $response->status >= 300 && $response->status < 400 => $this->redirected($batch, $response),
@@ -319,7 +345,7 @@ final class Sender
                 ));
                 continue;
             }
-            $this->awaitingSecondTry[$event->id] = true;
+            $this->rememberAsUnverdicted($event->id);
             $requeue[] = $event;
         }
 
@@ -334,6 +360,22 @@ final class Sender
         }
 
         return true;
+    }
+
+    /**
+     * Bounded: a server that never names anything may not grow this without end (review finding 12, and
+     * Java's `rememberAsUnverdicted`). An id lands here whenever an event is answered 202 without a
+     * verdict, and leaves it on the next answer that names it — but an event evicted from the queue by
+     * overflow before its second try never comes back, and its 36-character key stayed for the lifetime
+     * of the worker. The same bound as the queue, because this set cannot usefully outgrow what the
+     * queue can hold; the oldest key goes first, which is the one whose event is longest gone.
+     */
+    private function rememberAsUnverdicted(string $id): void
+    {
+        if (count($this->awaitingSecondTry) >= $this->config->maxQueueSize) {
+            array_shift($this->awaitingSecondTry);
+        }
+        $this->awaitingSecondTry[$id] = true;
     }
 
     /**
@@ -432,6 +474,40 @@ final class Sender
         ));
 
         return true;
+    }
+
+    /**
+     * C16: a 407 comes from the PROXY, never from the ingest, and has to be reported as such — "the
+     * ingest answered an unexpected 407" sends an operator to look at the Anvil token and the endpoint
+     * while the thing that refused is one hop earlier in their own network. Before this arm existed the
+     * `default` row dropped the batch and then dropped every later one in silence, which is the one
+     * outcome C16 forbids: a Laravel application in a corporate network with `https_proxy` exported and
+     * the proxy's credentials not yet configured lost its whole error stream to a single line blaming
+     * the ingest.
+     *
+     * It is treated as a TRANSPORT FAILURE: the events stay queued and the backoff grows, so a proxy
+     * whose credentials are fixed five minutes later loses nothing.
+     *
+     * The line names the proxy where the transport could identify it — host and port only, C15/X11: no
+     * credential and no Base64 of one ever reaches a log. Neither bundled transport can: libcurl and the
+     * raw socket read the proxy out of the environment themselves, so the reason field is empty and the
+     * line says "the configured proxy". The counterpart of `Sender.proxyRefused` (C9), including that
+     * fallback.
+     *
+     * @param list<Event> $batch
+     */
+    private function proxyRefused(array $batch, float $now, Response $response): bool
+    {
+        $proxy = trim($response->failureReason) === ''
+            ? 'the configured proxy'
+            : Response::redact($response->failureReason);
+        $this->sayOnce('status:407', 'anvil-feed: ' . $proxy . ' answered 407 — the PROXY refused this '
+            . 'request, not the Anvil ingest. Basic proxy authentication is required and the credentials '
+            . 'this process holds were absent, wrong, or could not be offered. Set HTTP(S)_PROXY with '
+            . 'userinfo, or configure the proxy credentials your HTTP client reads. Events are KEPT and '
+            . 'retried, not dropped.');
+
+        return $this->backOff($batch, $now, 'the proxy answered 407');
     }
 
     /**

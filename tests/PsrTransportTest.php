@@ -97,6 +97,22 @@ final class PsrTransportTest extends TestCase
             . 'default; (int) "Wed, …" is 0 and would turn a rate limit into a hot loop');
     }
 
+    /** The same length cap as the bundled transport — one reader, one rule (review finding 8). */
+    public function testARetryAfterOfTwentyDigitsIsNullRatherThanForEver(): void
+    {
+        $client = new class implements ClientInterface {
+            public function sendRequest(RequestInterface $request): ResponseInterface
+            {
+                return new PsrResponse(429, ['Retry-After' => '99999999999999999999'], '');
+            }
+        };
+
+        $response = $this->transport($client)->post('https://example.test/api/feed/events', '{}');
+
+        self::assertNull($response->retryAfterSeconds,
+            'PHP_INT_MAX seconds is a muted worker, not a pause');
+    }
+
     public function testAClientExceptionBecomesATransportFailure(): void
     {
         $client = new class implements ClientInterface {

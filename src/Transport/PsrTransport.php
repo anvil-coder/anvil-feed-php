@@ -43,14 +43,12 @@ final class PsrTransport implements Transport
                 ->withBody($this->streams->createStream($body));
 
             $response = $this->client->sendRequest($request);
-            $retryAfter = trim($response->getHeaderLine('Retry-After'));
-
             $location = trim($response->getHeaderLine('Location'));
 
             return new Response(
                 $response->getStatusCode(),
                 (string) $response->getBody(),
-                $retryAfter !== '' && ctype_digit($retryAfter) ? (int) $retryAfter : null,
+                Response::retryAfterSeconds($response->getHeaderLine('Retry-After')),
                 false,
                 '',
                 $location === '' ? null : $location

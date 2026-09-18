@@ -11,11 +11,46 @@ namespace AnvilFeed\Transport;
  */
 final class Response
 {
-    /** `Bearer anv_srv_…` in any message that is about to be logged. */
+    /**
+     * Anything that looks like a credential, in a message that is about to be logged (C15, FR-9 e). The
+     * ORDER is the contract, not a detail: `Authorization\s*:?.*` swallows the rest of its line, so a
+     * `Basic …` that is NOT on an Authorization line has to be caught before it.
+     *
+     * The list is `IngestResponse.redact`'s, pattern for pattern (review finding 10). The two that used
+     * to be Java's alone:
+     *
+     *  - a proxy URL's Basic credentials, `http://user:secret@proxy:3128` — the shape C15/X11 name;
+     *  - a BARE `Basic dXNlcjpwdw==`. Basic transmits the password merely Base64-encoded, so that string
+     *    IS the credential rather than a hint of one, and only `Proxy-Authorization: Basic …` was covered
+     *    before — and then only by the accident that it contains the substring `Authorization`.
+     */
     private const CREDENTIAL_PATTERNS = [
-        '/Authorization\s*:?.*/is' => 'Authorization: [Filtered]',
+        '#(//)[^/@\s]+:[^/@\s]*@#' => '$1[Filtered]@',
         '/anv_(srv|pub)_[A-Za-z0-9]+/' => 'anv_$1_[Filtered]',
+        '#\bBasic\s+[A-Za-z0-9+/]{8,}={0,2}#i' => 'Basic [Filtered]',
+        '/Authorization\s*:?.*/is' => 'Authorization: [Filtered]',
     ];
+
+    /**
+     * The `Retry-After` header, delta-seconds only. RFC 9110 also allows an HTTP-date, which this ingest
+     * never sends (`Retry-After: 60` and `Retry-After: 30` are literals in AnvilFeedIngestController); an
+     * unreadable value becomes null and the sender falls back to its documented default rather than to 0,
+     * which would be a hot loop against a rate limiter.
+     *
+     * The LENGTH CAP is `HttpTransport.retryAfter`'s, verbatim (review finding 8). Without it a proxy
+     * answering `Retry-After: 99999999999999999999` saturates the cast to PHP_INT_MAX seconds and
+     * `Sender::pause` mutes a long-lived worker for the rest of its life; nine digits is thirty-one
+     * years, and anything longer is a defect in whatever wrote the header, not a window.
+     *
+     * It lives here rather than in a transport because BOTH transports read that header, and a cap that
+     * holds on one of them is the drift C9/C17 forbid.
+     */
+    public static function retryAfterSeconds(?string $raw): ?int
+    {
+        $value = $raw === null ? '' : trim($raw);
+
+        return $value !== '' && ctype_digit($value) && strlen($value) <= 9 ? (int) $value : null;
+    }
 
     public function __construct(
         public readonly int $status,

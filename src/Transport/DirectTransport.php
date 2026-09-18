@@ -269,16 +269,10 @@ final class DirectTransport implements Transport
         ];
     }
 
-    /**
-     * Only the delta-seconds form. RFC 9110 also allows an HTTP-date, which this ingest never sends
-     * (`Retry-After: 60` and `Retry-After: 30` are literals in AnvilFeedIngestController); an unreadable
-     * value becomes null and the sender falls back to its documented default rather than to 0.
-     */
+    /** Delta-seconds only, and length-capped: the rule and the reason are in {@see Response::retryAfterSeconds}. */
     private static function retryAfter(string $headerBlock): ?int
     {
-        $value = self::header($headerBlock, 'retry-after');
-
-        return $value !== null && ctype_digit($value) ? (int) $value : null;
+        return Response::retryAfterSeconds(self::header($headerBlock, 'retry-after'));
     }
 
     private static function header(string $headerBlock, string $name): ?string

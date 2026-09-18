@@ -713,6 +713,142 @@ final class SenderTest extends TestCase
         self::assertStringContainsString('[Filtered]', $lines, 'and says that something was removed');
     }
 
+    // ---------------------------------------------------------------- C16: the 407 is the proxy's
+
+    public function testA407IsTheProxysAnswerAndKeepsTheEventsQueued(): void
+    {
+        $queue = $this->queue();
+        $queue->push($this->event('11111111-1111-4111-8111-111111111111'));
+        $transport = new RecordingTransport(
+            new Response(407, '', null, false, 'the proxy corp-gw.internal:3128')
+        );
+
+        $sender = $this->sender($queue, $transport);
+        $sender->flush();
+
+        self::assertSame(1, $queue->count(),
+            'a proxy whose credentials are fixed five minutes later must lose nothing — this is the '
+            . 'environment C11/C15 exist for');
+        self::assertFalse($sender->isStopped());
+        self::assertGreaterThan($this->now + 0.8, $sender->pausedUntil(),
+            'backed off like any transport failure, not dropped and not paused for ever');
+        self::assertLessThan($this->now + 1.2, $sender->pausedUntil());
+
+        $said = $this->written->matching('PROXY refused');
+        self::assertCount(1, $said, 'the explanation is said once per process; the per-attempt backoff '
+            . 'line beside it is not that explanation');
+        self::assertStringContainsString('corp-gw.internal:3128', $said[0],
+            'C16: the operator must be sent to the PROXY, not to the Anvil token');
+        self::assertStringContainsString('not the Anvil ingest', $said[0]);
+        self::assertSame($said[0], Response::redact($said[0]),
+            'C15/X11: the line an operator actually reads carries no credential, in cleartext or in '
+            . 'Base64');
+    }
+
+    public function testA407IsNeverReportedAsAnUnexpectedStatus(): void
+    {
+        $queue = $this->queue();
+        $queue->push($this->event('11111111-1111-4111-8111-111111111111'));
+        $transport = new RecordingTransport(new Response(407, ''));
+
+        $this->sender($queue, $transport)->flush();
+
+        self::assertSame([], $this->written->matching('unexpected'),
+            'the generic 4xx row drops the batch and then drops every later event in silence — the one '
+            . 'outcome C16 forbids');
+        self::assertSame(1, $queue->count());
+        self::assertNotSame([], $this->written->matching('the configured proxy'),
+            'a transport that cannot name the proxy still says it was a proxy');
+    }
+
+    // ---------------------------------------------------------------- FR-3 (a): the request budget floor
+
+    /**
+     * Finding 9. With a handful of milliseconds left a request can only fail locally, and that failure
+     * used to arm a real backoff — at the end of EVERY flush that drains a deep queue, which is the
+     * ordinary case after an outage and the one FR-3 (a) is about.
+     */
+    public function testARequestBelowTheMinimumBudgetIsNotIssuedAndArmsNoBackoff(): void
+    {
+        $queue = $this->queue();
+        $queue->push($this->event('11111111-1111-4111-8111-111111111111'));
+        $transport = new RecordingTransport();
+
+        $sender = $this->sender($queue, $transport);
+        $sender->flush($this->now + 0.02);
+
+        self::assertSame([], $transport->calls, '20 ms is not a request, it is a failure that costs a socket');
+        self::assertSame(1, $queue->count(), 'the batch is requeued for the next flush');
+        self::assertSame(0.0, $sender->pausedUntil(),
+            'not attempted is not failed: nothing the network did justifies a pause here');
+    }
+
+    // ---------------------------------------------------------------- finding 12: a bounded set
+
+    /**
+     * The one unbounded structure the review found. An id lands in the unverdicted set whenever the
+     * ingest answers 202 without naming the event, and leaves it on the answer that names it — but an
+     * event evicted from the queue before its second try never comes back, and its 36-character key
+     * stayed for the lifetime of the worker (a rewriting proxy plus queue overflow, on Octane or a
+     * queue worker).
+     *
+     * Read through reflection because an unbounded private map has no behaviour to observe from
+     * outside: that is exactly what makes it the kind of leak nobody notices. Java bounds its twin at
+     * the same number (`Sender.rememberAsUnverdicted`).
+     */
+    public function testTheUnverdictedSetIsBoundedByMaxQueueSize(): void
+    {
+        $queue = $this->queue(5);
+        $sender = $this->sender($queue, new RecordingTransport(), ['max_queue_size' => 5]);
+
+        for ($round = 0; $round < 20; $round++) {
+            $queue->push($this->event(sprintf('11111111-1111-4111-8111-%012d', $round)));
+            // The ingest answers 202 and names nobody, so the event is remembered and requeued …
+            $sender->flush();
+            // … and is then evicted before its second try ever happens.
+            $queue->clear();
+        }
+
+        $remembered = new \ReflectionProperty(Sender::class, 'awaitingSecondTry');
+
+        self::assertLessThanOrEqual(5, count($remembered->getValue($sender)),
+            'a server that never names anything may not grow this without end');
+    }
+
+    // ---------------------------------------------------------------- C15/X11: the redaction parity
+
+    /**
+     * Finding 10. Both extra patterns are Java's (`IngestResponse.redact`): a proxy URL's userinfo, and
+     * a BARE `Basic <base64>` — Basic transmits the password merely Base64-encoded, so that string IS
+     * the credential and not a hint of one, and until now only `Proxy-Authorization: Basic …` was
+     * covered, and then only by the accident that it contains the substring `Authorization`.
+     */
+    public function testAProxyCredentialInATransportFailureNeverReachesTheLog(): void
+    {
+        $queue = $this->queue();
+        $queue->push($this->event('11111111-1111-4111-8111-111111111111'));
+        $leaking = new class implements \AnvilFeed\Transport\Transport {
+            public function post(string $url, string $body, ?int $timeoutMs = null): Response
+            {
+                throw new \RuntimeException(
+                    'proxy CONNECT failed for http://admin:hunter2@corp-gw.internal:3128 '
+                    . '(offered Basic YWRtaW46aHVudGVyMg==)'
+                );
+            }
+        };
+
+        $sender = new Sender($this->config(), $queue, $leaking, new Logger($this->written),
+            fn (): float => $this->now);
+        $sender->flush();
+
+        $lines = implode("\n", $this->written->lines);
+        self::assertStringNotContainsString('hunter2', $lines, 'the password itself');
+        self::assertStringNotContainsString('YWRtaW46aHVudGVyMg==', $lines, 'and its Base64 encoding');
+        self::assertStringContainsString('corp-gw.internal:3128', $lines,
+            'the host and port are what an operator needs; they are not the credential');
+        self::assertStringContainsString('[Filtered]', $lines);
+    }
+
     /** Used by the slow transport above to move the injected clock. */
     public function advance(float $seconds): void
     {
