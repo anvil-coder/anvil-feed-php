@@ -458,12 +458,27 @@ final class EventFactory
      * whole event a `schema_violation`. This is the Java core's `asInteger()` (task-6 review finding 2),
      * rule for rule, so that C9/C17 hold here too.
      *
+     * A FLOAT is only a status code when it IS a whole number. `200.0` is the 200 a JSON or properties hop
+     * turned into a float — every `json_decode` of `{"status_code": 200.0}` hands one over — and dropping
+     * it lost a status the caller did state. `200.5` is not a status at all, and a cast would have shown it
+     * in a cockpit as 200; `NAN` casts to 0, which reads as "the request never completed", and `INF` casts
+     * to PHP_INT_MIN. So: finite, whole, and inside the integer range, or nothing. This is the float branch
+     * the Java core grew in f80e0e1 (task-9 parity list), the same rule the string branch already gives
+     * `"200.5"`.
+     *
      * @return int|null the status as the schema's integer, or null when it is not one
      */
     private static function asInteger(mixed $value): ?int
     {
         if (is_int($value)) {
             return $value;
+        }
+        if (is_float($value)) {
+            // The range check is not decoration: casting a float outside the integer range is undefined in
+            // PHP 8 and would invent a status nobody sent — the same reason Java bounds its own float branch.
+            return is_finite($value) && floor($value) === $value
+                && $value >= (float) PHP_INT_MIN && $value < (float) PHP_INT_MAX
+                    ? (int) $value : null;
         }
         if (is_string($value) && preg_match('/^-?\d+$/', trim($value)) === 1) {
             return (int) trim($value);

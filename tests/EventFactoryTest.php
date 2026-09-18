@@ -301,6 +301,11 @@ final class EventFactoryTest extends TestCase
      * (`EventFactory.asInteger()`, task-6 review finding 2); one member of an optional block is a cheaper
      * loss than a guessed one. C9/C17: the same rule in both languages.
      *
+     * The float rows are the same rule one level down. `json_decode('{"status_code": 200.0}')` hands over a
+     * PHP float, and the 200 the caller stated used to be dropped; `200.5`, `NAN` and `INF` are not status
+     * codes at all and a cast would have shown 200, 0 and PHP_INT_MIN respectively in the cockpit as fact.
+     * The Java core grew this branch in f80e0e1, and this table is its twin.
+     *
      * @param mixed $given
      */
     #[DataProvider('everyShapeAStatusCodeArrivesIn')]
@@ -329,6 +334,22 @@ final class EventFactoryTest extends TestCase
             'a numeric string'          => ['404', 404],
             'a numeric string, padded'  => ['  404  ', 404],
             'a negative integer string' => ['-1', -1],
+
+            // The FLOAT rows. A status that took a JSON or properties hop arrives as 200.0 in PHP just as
+            // it arrives as a Double in Java, and the Java core reads it as the 200 it is
+            // (EventFactory.asInteger, commit f80e0e1). Everything that is not a whole, finite number is
+            // not a status code at all and is dropped rather than truncated: 200.5 must not become 200,
+            // NAN and INF must not become 0 or PHP_INT_MAX.
+            'an integral float'         => [200.0, 200],
+            'an integral float, zero'   => [0.0, 0],
+            'an integral float, signed' => [-1.0, -1],
+            'a non-integral float'      => [200.5, null],
+            'a fraction below zero'     => [-0.5, null],
+            'the float NAN'             => [NAN, null],
+            'positive infinity'         => [INF, null],
+            'negative infinity'         => [-INF, null],
+            'a float past PHP_INT_MAX'  => [1.0e20, null],
+
             'digits with a tail'        => ['12abc', null],
             'not a number at all'       => ['abc', null],
             'a decimal string'          => ['200.5', null],
