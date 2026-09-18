@@ -280,6 +280,40 @@ final class LoopGuardTest extends TestCase
         self::assertTrue($gate->allow('f'), 'a backwards step opens a new window rather than freezing one');
     }
 
+    /**
+     * A rewrite rule or a permissive router can hand the path over exactly as it arrived on the wire, and
+     * a guard that matched it raw would answer "not ignored" for the ingest's own endpoint and report the
+     * ingest's own failure to the ingest (Java's task-8 review finding 9).
+     */
+    public function testAnEncodedPathIsDecodedOnceBeforeItIsMatched(): void
+    {
+        $guard = new LoopGuard(['/api/feed/**']);
+
+        self::assertTrue($guard->ignoresPath('/api/%66eed/events'), "%66 is 'f'");
+        self::assertTrue($guard->ignoresPath('/API/%46EED/events'));
+        self::assertTrue($guard->ignoresPath('/app/%2e%2e/api/feed/events'), 'an encoded dot-dot segment');
+        self::assertTrue($guard->ignoresPath('/api/feed%2Fevents'), 'an encoded separator is still one');
+        self::assertTrue($guard->ignoresPath('%2Fapi%2Ffeed'), 'and so is a wholly encoded path');
+        self::assertFalse($guard->ignoresPath('/api/%66eedback'));
+    }
+
+    /**
+     * ONCE, and not to a fixed point: decoding twice would turn `%2525` into `%` and make a literal
+     * segment somebody really serves match a pattern it does not. A broken escape is a path that was
+     * never encoded at all, and it is left exactly as it is rather than raising on the capture path.
+     */
+    public function testDecodingHappensOnceAndABrokenEscapeIsLeftAlone(): void
+    {
+        $guard = new LoopGuard(['/api/%/**']);
+
+        self::assertTrue($guard->ignoresPath('/api/%25/events'), '%25 is the one percent the pattern has');
+        self::assertFalse($guard->ignoresPath('/api/%2525/events'), 'decoded once, this is %25 and not %');
+
+        $feed = new LoopGuard(['/api/feed/**']);
+        self::assertTrue($feed->ignoresPath('/api/feed/ev%zz'), 'an invalid escape is not an exception');
+        self::assertTrue($feed->ignoresPath('/api/feed/%'), '…and neither is a truncated one');
+    }
+
     /** Finding 6: every shape a rewrite rule or a permissive router can put in front of the guard. */
     public function testMatchingIsCaseInsensitiveAndResolvesDotSegments(): void
     {

@@ -60,7 +60,7 @@ final class LoopGuard
         if ($path === null || $path === '') {
             return false;
         }
-        $normalized = self::canonical(self::cutQuery(self::withoutOrigin($path)));
+        $normalized = self::canonical(self::percentDecoded(self::cutQuery(self::withoutOrigin($path))));
         foreach ($this->patterns as $pattern) {
             if (preg_match($pattern, $normalized) === 1) {
                 return true;
@@ -131,6 +131,28 @@ final class LoopGuard
         }
 
         return '/' . implode('/', $resolved);
+    }
+
+    /**
+     * Percent-decoding, ONCE. A host is expected to hand over the path it actually routed on, and this is
+     * the backstop for the ones that do not: `/api/%66eed/events` and `/app/%2e%2e/api/feed/events` both
+     * reach a permissive router or a rewrite rule as written, and a guard that matched them raw would
+     * answer "not ignored" and report the ingest's own failure to the ingest.
+     *
+     * Once and not to a fixed point: decoding repeatedly would turn `%2525` into `%` and make a literal
+     * path segment somebody really serves match a pattern it does not. `rawurldecode` is exactly one
+     * pass, it leaves a sequence that is not valid percent-encoding (`%zz`, a truncated `%`) exactly as
+     * it is — a path is not required to be encoded at all — and unlike `urldecode` it does not read `+`
+     * as a space, which is a query-string rule and not a path rule. It decodes BEFORE `canonical()`
+     * lower-cases, so that `%46` becomes the `F` that `FEED` then lower-cases.
+     *
+     * The Java twin decodes the same single pass by hand and reads the bytes back as UTF-8, replacing
+     * what will not decode; PHP hands the raw bytes on. Either way an undecodable byte matches no ASCII
+     * pattern, and neither raises — this runs on the capture path (Java's task-8 review finding 9).
+     */
+    private static function percentDecoded(string $path): string
+    {
+        return str_contains($path, '%') ? rawurldecode($path) : $path;
     }
 
     private static function cutQuery(string $path): string
