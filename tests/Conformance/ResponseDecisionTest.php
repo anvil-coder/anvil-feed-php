@@ -17,9 +17,9 @@ use PHPUnit\Framework\TestCase;
 
 /**
  * `conformance/README.md`: "Feed the `body` of the matching entry in `responses/index.json` to the SDK's
- * response parser and assert the resulting decision (drop, retry, pause, stop) against that entry's
- * `status` and `retry_after` — the actual HTTP status and header the SDK's retry rule keys on, not the
- * file name."
+ * response parser and assert the resulting decision — the entry's own `retry` verdict: `none` (drop or
+ * clear), `after-delay`, `whole-batch`, `backoff` — against that entry's `status` and `retry_after` —
+ * the actual HTTP status and header the SDK's retry rule keys on, not the file name."
  *
  * This is that gate, and it is driven by the index rather than by a transcription of it: a response the
  * server learns to give is added in one place, and this suite starts exercising it. The retry table of
