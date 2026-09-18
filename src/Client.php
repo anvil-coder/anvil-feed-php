@@ -209,7 +209,9 @@ final class Client
             $event = $build();
             $fingerprint = Fingerprint::ofEvent($event->payload);
             if (!$this->rateGate->allow($fingerprint)) {
-                $this->sayTheStormOnce($fingerprint);
+                if ($this->rateGate->firstSuppression($fingerprint)) {
+                    $this->sayTheStorm($fingerprint);
+                }
 
                 return null;
             }
@@ -358,12 +360,16 @@ final class Client
         return false;
     }
 
-    /** One log line per window per fingerprint — the storm itself must not become the log flood. */
-    private function sayTheStormOnce(string $fingerprint): void
+    /**
+     * One log line per window per fingerprint — the storm itself must not become the log flood. The
+     * "once" is decided by `RateGate::firstSuppression()`, inside the gate: reading
+     * `suppressed(...) !== 1` here was a SECOND question about a number the gate had already moved past,
+     * and after `suppressed()` stopped falling back to the shared bucket it could not see an overflowed
+     * storm at all. The gate now hands the edge back with the verdict and consumes it (the Java twin's
+     * task-8 review finding 3).
+     */
+    private function sayTheStorm(string $fingerprint): void
     {
-        if ($this->rateGate->suppressed($fingerprint) !== 1) {
-            return;
-        }
         $this->logger->warning(sprintf(
             'anvil-feed: more than %d occurrences of %s per %dms; suppressing locally. '
             . 'The ingest counts occurrences server-side, so nothing is lost that matters.',

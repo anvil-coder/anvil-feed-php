@@ -121,6 +121,44 @@ final class ClientTest extends TestCase
     }
 
     /**
+     * One line per WINDOW — not one per storm, and not one per dropped event. Two windows of the same
+     * fault cost exactly two lines.
+     *
+     * The client used to decide this by asking the gate a SECOND question after the gate had answered the
+     * first: `suppressed($fingerprint) !== 1`. The gate now hands back the edge together with the verdict
+     * and consumes it, so nothing can step over the edge between the two reads (Java's task-8 review
+     * finding 3). The count here is measured, not argued: 1000 captures, 20 queued, 2 lines.
+     */
+    public function testAStormSpanningTwoWindowsCostsExactlyTwoLogLines(): void
+    {
+        $now = 1000.0;
+        $sink = new RecordingLogger();
+        $logger = new Logger($sink);
+        $config = Config::fromArray([
+            'token' => 'anv_srv_0123456789abcdef0123456789abcdef',
+            'service' => 'disponio-api',
+            'fingerprint_cap' => 10,
+            'fingerprint_window_ms' => 60000,
+        ], $logger);
+        $client = Client::create($config, new RecordingTransport(), $logger, GitContext::none(),
+            function () use (&$now) { return $now; });
+
+        for ($i = 0; $i < 500; $i++) {
+            $client->captureMessage('the same fault every time', 'error');
+        }
+        self::assertCount(1, $sink->matching('suppressing locally'), 'the first window said it once');
+
+        $now += 61.0;   // the window moves on
+        for ($i = 0; $i < 500; $i++) {
+            $client->captureMessage('the same fault every time', 'error');
+        }
+
+        self::assertCount(2, $sink->matching('suppressing locally'),
+            'and the second window said it once more — 1000 captures, 980 dropped, two lines');
+        self::assertSame(20, $client->queue()->count(), 'ten per window got through, and only ten');
+    }
+
+    /**
      * A second, unrelated fault is not silenced by the first one's storm — and "unrelated" means what the
      * INGEST means by it. Two different message texts raised from the same line are one group, because
      * IncidentFingerprint deliberately leaves the message out (messages carry order numbers, and one

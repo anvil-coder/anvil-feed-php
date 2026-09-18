@@ -16,7 +16,7 @@ final class RateGate
 {
     private const MAX_TRACKED = 500;
 
-    /** @var array<string, array{start: float, count: int, suppressed: int}> */
+    /** @var array<string, array{start: float, count: int, suppressed: int, stormSaid: bool}> */
     private array $windows = [];
     /**
      * Where a fingerprint goes when the table is full and nothing in it has expired. One shared window
@@ -24,7 +24,7 @@ final class RateGate
      * counted apart. The alternative — letting a newcomer through because there is no room to remember
      * it — is an uncapped storm on the one code path that exists to cap storms.
      *
-     * @var array{start: float, count: int, suppressed: int}|null
+     * @var array{start: float, count: int, suppressed: int, stormSaid: bool}|null
      */
     private ?array $overflow = null;
     /** @var \Closure(): float */
@@ -71,7 +71,7 @@ final class RateGate
         if (!$this->makeRoom($now)) {
             return $this->allowOverflow($now);
         }
-        $this->windows[$fingerprint] = ['start' => $now, 'count' => 1, 'suppressed' => 0];
+        $this->windows[$fingerprint] = ['start' => $now, 'count' => 1, 'suppressed' => 0, 'stormSaid' => false];
 
         return true;
     }
@@ -96,6 +96,36 @@ final class RateGate
     public function suppressedOverflow(): int
     {
         return $this->overflow['suppressed'] ?? 0;
+    }
+
+    /**
+     * True exactly ONCE per window for the thing that just suppressed this fingerprint — its own window,
+     * or the shared bucket when the table had no room to track it apart. Call it only immediately after
+     * `allow()` has answered false; by construction, whatever just refused is what this consumes the edge
+     * on.
+     *
+     * It lives here, in the gate, because the caller's version of it — read `suppressed(...)` and compare
+     * with 1 — was a SECOND question about a number the gate had already moved past. The edge and the
+     * state it is read off cannot come apart if only one of them exists. (The Java twin's
+     * `firstSuppression`, where the two reads were two synchronized calls with a gap between them and two
+     * threads storming one fingerprint could step over the edge together and both stay silent — losing
+     * the line in exactly the case a storm arrives in; task-8 review finding 3. PHP has no such race, and
+     * C9/C17 want the two cores to read alike anyway.)
+     */
+    public function firstSuppression(string $fingerprint): bool
+    {
+        $tracked = isset($this->windows[$fingerprint]);
+        $target = $tracked ? $this->windows[$fingerprint] : $this->overflow;
+        if ($target === null || $target['suppressed'] === 0 || $target['stormSaid']) {
+            return false;
+        }
+        if ($tracked) {
+            $this->windows[$fingerprint]['stormSaid'] = true;
+        } else {
+            $this->overflow['stormSaid'] = true;
+        }
+
+        return true;
     }
 
     /**
@@ -127,7 +157,7 @@ final class RateGate
     private function allowOverflow(float $now): bool
     {
         if ($this->overflow === null || $this->hasExpired($this->overflow, $now)) {
-            $this->overflow = ['start' => $now, 'count' => 1, 'suppressed' => 0];
+            $this->overflow = ['start' => $now, 'count' => 1, 'suppressed' => 0, 'stormSaid' => false];
 
             return true;
         }
@@ -141,7 +171,7 @@ final class RateGate
         return false;
     }
 
-    /** @param array{start: float, count: int, suppressed: int} $window */
+    /** @param array{start: float, count: int, suppressed: int, stormSaid: bool} $window */
     private function hasExpired(array $window, float $now): bool
     {
         $elapsedMs = ($now - $window['start']) * 1000;

@@ -197,6 +197,56 @@ final class LoopGuardTest extends TestCase
             'and the drops are countable by name, so an overflowed storm can still be said');
     }
 
+    /**
+     * The edge the client says the storm line on, consumed inside the gate.
+     *
+     * The client used to decide it by reading `suppressed($fingerprint) !== 1` — a SECOND question to the
+     * gate, asked after the gate had already moved past the answer. The gate now hands the edge back
+     * itself, and consumes it, so that the reading and the state it reads cannot come apart (Java's
+     * task-8 review finding 3; `RateGate.firstSuppression`, rule for rule).
+     */
+    public function testTheStormEdgeIsConsumedExactlyOncePerWindow(): void
+    {
+        $now = 1000.0;
+        $gate = new RateGate(1, 60000, function () use (&$now) { return $now; });
+
+        self::assertTrue($gate->allow('f'));
+        self::assertFalse($gate->firstSuppression('f'), 'nothing has been suppressed yet');
+        self::assertFalse($gate->allow('f'));
+        self::assertTrue($gate->firstSuppression('f'), 'the first drop of this window');
+        self::assertFalse($gate->allow('f'));
+        self::assertFalse($gate->firstSuppression('f'), 'and never again in this window');
+
+        $now += 61.0;
+        self::assertTrue($gate->allow('f'));
+        self::assertFalse($gate->allow('f'));
+        self::assertTrue($gate->firstSuppression('f'), 'a new window says it again');
+    }
+
+    /**
+     * A fingerprint counted against the shared bucket still gets its window said once. Its own counter is
+     * zero — that is the point of the previous commit — so the edge, and not a counter, is what carries
+     * this: the bucket has its own window and its own once.
+     */
+    public function testTheStormEdgeIsSaidForAnOverflowedFingerprintToo(): void
+    {
+        $now = 1000.0;
+        $gate = new RateGate(1, 60000, function () use (&$now) { return $now; });
+        for ($i = 0; $i < 600; $i++) {
+            $gate->allow('live-' . $i);
+        }
+
+        $said = 0;
+        for ($i = 0; $i < 20; $i++) {
+            if (!$gate->allow('newcomer-' . $i) && $gate->firstSuppression('newcomer-' . $i)) {
+                $said++;
+            }
+        }
+
+        self::assertSame(1, $said, 'the bucket\'s window is said once — an overflowed storm is neither '
+            . 'silent nor a line per event');
+    }
+
     /** An expired entry is capping nothing, so it is the one that makes room — and the table stays bounded. */
     public function testAnExpiredEntryIsTheOneThatMakesRoom(): void
     {
