@@ -110,18 +110,41 @@ final class Config
                 'max_queue_size',
                 $logger
             ),
-            flushIntervalMs: self::intOption($options, 'flush_interval_ms', 2000, $logger),
+            flushIntervalMs: self::atLeastOne(
+                self::intOption($options, 'flush_interval_ms', 2000, $logger),
+                'flush_interval_ms',
+                $logger
+            ),
             batchSize: min(50, max(1, self::intOption($options, 'batch_size', 50, $logger))),
-            connectTimeoutMs: self::intOption($options, 'connect_timeout_ms', 1000, $logger),
-            requestTimeoutMs: self::intOption($options, 'request_timeout_ms', 2000, $logger),
+            // A non-positive connect or request timeout is refused by the transport on the first send and
+            // reads to an operator like "no timeout"; a flush interval of zero is a busy loop, not a faster
+            // flush. All three go through the same floor as the queue bound.
+            connectTimeoutMs: self::atLeastOne(
+                self::intOption($options, 'connect_timeout_ms', 1000, $logger),
+                'connect_timeout_ms',
+                $logger
+            ),
+            requestTimeoutMs: self::atLeastOne(
+                self::intOption($options, 'request_timeout_ms', 2000, $logger),
+                'request_timeout_ms',
+                $logger
+            ),
             maxFrames: min(50, max(1, self::intOption($options, 'max_frames', 50, $logger))),
             contextLines: min(20, max(0, self::intOption($options, 'context_lines', 20, $logger))),
             maxContextLineChars:
                 min(400, max(1, self::intOption($options, 'max_context_line_chars', 400, $logger))),
             denylist: self::listOption($options, 'denylist', self::DEFAULT_DENYLIST, $logger),
             enabled: $enabled,
-            fingerprintCap: self::intOption($options, 'fingerprint_cap', 10, $logger),
-            fingerprintWindowMs: self::intOption($options, 'fingerprint_window_ms', 60000, $logger),
+            fingerprintCap: self::atLeastZero(
+                self::intOption($options, 'fingerprint_cap', 10, $logger),
+                'fingerprint_cap',
+                $logger
+            ),
+            fingerprintWindowMs: self::atLeastZero(
+                self::intOption($options, 'fingerprint_window_ms', 60000, $logger),
+                'fingerprint_window_ms',
+                $logger
+            ),
             ignoredRequestPaths:
                 self::listOption($options, 'ignored_request_paths', ['/api/feed/**'], $logger),
         );
@@ -289,6 +312,10 @@ final class Config
      * A queue bound of zero or less is not a smaller queue, it is a queue that drops every event it is
      * given and writes a warning about each — a log flood on the one code path that exists to prevent
      * one. Clamped, and said once, the way the environment repair is.
+     *
+     * The same floor holds for `flush_interval_ms`, `connect_timeout_ms` and `request_timeout_ms`, and the
+     * message is deliberately the one message: the Java core clamps the four through its own `atLeastOne`
+     * (task-6 review finding 11), and C9/C17 forbid a bound that exists in one language only.
      */
     private static function atLeastOne(int $value, string $key, Logger $logger): int
     {
@@ -303,6 +330,21 @@ final class Config
         ));
 
         return 1;
+    }
+
+    /**
+     * A floor of ZERO, not of one: a cap or a window of zero is a value an operator can mean — no repeat
+     * suppression at all — and clamping it to one would switch a feature back ON for somebody who had
+     * switched it off. A NEGATIVE cap or window is not a smaller one, it is an undefined one.
+     */
+    private static function atLeastZero(int $value, string $key, Logger $logger): int
+    {
+        if ($value >= 0) {
+            return $value;
+        }
+        $logger->once('clamp:' . $key, sprintf('anvil-feed: "%s" is %d; 0 is used instead.', $key, $value));
+
+        return 0;
     }
 
     private static function sayItIsUnreadable(

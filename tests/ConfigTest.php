@@ -6,6 +6,7 @@ namespace AnvilFeed\Tests;
 
 use AnvilFeed\Config;
 use AnvilFeed\Logger;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\AbstractLogger;
 
@@ -537,5 +538,105 @@ final class ConfigTest extends TestCase
             $written->lines,
             static fn (string $line): bool => str_contains($line, 'max_queue_size')
         )));
+    }
+
+    /**
+     * The three knobs Task 7 would choke on. A flush interval, a connect timeout or a request timeout of
+     * zero is not "no wait", it is a busy loop and a transport that refuses the value on the first send —
+     * the Java core clamps all three through the same `atLeastOne` as the queue bound (task-6 review
+     * finding 11), and C9/C17 forbid a bound that exists in one language only.
+     *
+     * @param int|string $given
+     */
+    #[DataProvider('everyKnobThatHasAFloorOfOne')]
+    public function testAKnobWithAFloorOfOneIsClampedAndSaidOnce(string $key, int $given): void
+    {
+        $written = new \AnvilFeed\Tests\Support\RecordingLogger();
+        $config = Config::fromArray([
+            'token' => 'anv_srv_0123456789abcdef0123456789abcdef',
+            'service' => 'disponio-api',
+            $key => $given,
+        ], new Logger($written));
+
+        self::assertSame(1, $config->{self::PROPERTY_OF[$key]}, $key . ' was not clamped to its floor of 1');
+        $said = $written->matching('"' . $key . '"');
+        self::assertCount(1, $said, 'the clamp of ' . $key . ' was said ' . count($said) . ' times, not once');
+        self::assertStringContainsString(
+            'anvil-feed: "' . $key . '" is ' . $given . '; 1 is used instead',
+            $said[0]
+        );
+    }
+
+    /** @return array<string, array{0: string, 1: int}> */
+    public static function everyKnobThatHasAFloorOfOne(): array
+    {
+        $rows = [];
+        foreach (['max_queue_size', 'flush_interval_ms', 'connect_timeout_ms', 'request_timeout_ms'] as $key) {
+            $rows[$key . ' at zero'] = [$key, 0];
+            $rows[$key . ' negative'] = [$key, -5];
+        }
+
+        return $rows;
+    }
+
+    private const PROPERTY_OF = [
+        'max_queue_size' => 'maxQueueSize',
+        'flush_interval_ms' => 'flushIntervalMs',
+        'connect_timeout_ms' => 'connectTimeoutMs',
+        'request_timeout_ms' => 'requestTimeoutMs',
+        'fingerprint_cap' => 'fingerprintCap',
+        'fingerprint_window_ms' => 'fingerprintWindowMs',
+    ];
+
+    /**
+     * The other two have a floor of ZERO, not one: a cap of zero is a cap a reader can mean, a NEGATIVE
+     * cap or window is not a smaller one, it is an undefined one. Java's `atLeastZero`, same message.
+     */
+    #[DataProvider('everyKnobThatHasAFloorOfZero')]
+    public function testAKnobWithAFloorOfZeroIsClampedAndSaidOnce(string $key, int $given): void
+    {
+        $written = new \AnvilFeed\Tests\Support\RecordingLogger();
+        $config = Config::fromArray([
+            'token' => 'anv_srv_0123456789abcdef0123456789abcdef',
+            'service' => 'disponio-api',
+            $key => $given,
+        ], new Logger($written));
+
+        self::assertSame(0, $config->{self::PROPERTY_OF[$key]}, $key . ' was not clamped to its floor of 0');
+        $said = $written->matching('"' . $key . '"');
+        self::assertCount(1, $said, 'the clamp of ' . $key . ' was said ' . count($said) . ' times, not once');
+        self::assertStringContainsString(
+            'anvil-feed: "' . $key . '" is ' . $given . '; 0 is used instead',
+            $said[0]
+        );
+    }
+
+    /** @return array<string, array{0: string, 1: int}> */
+    public static function everyKnobThatHasAFloorOfZero(): array
+    {
+        return [
+            'fingerprint_cap negative' => ['fingerprint_cap', -1],
+            'fingerprint_window_ms negative' => ['fingerprint_window_ms', -60000],
+        ];
+    }
+
+    /**
+     * And the floor is a floor, not a minimum of one: zero is a value an operator can mean for both — no
+     * repeat suppression at all — so it passes through untouched and says nothing. A clamp that swallowed
+     * it would switch a feature back ON for somebody who had switched it off.
+     */
+    public function testAFingerprintCapOrWindowOfZeroIsLeftAloneAndSaysNothing(): void
+    {
+        $written = new \AnvilFeed\Tests\Support\RecordingLogger();
+        $config = Config::fromArray([
+            'token' => 'anv_srv_0123456789abcdef0123456789abcdef',
+            'service' => 'disponio-api',
+            'fingerprint_cap' => 0,
+            'fingerprint_window_ms' => 0,
+        ], new Logger($written));
+
+        self::assertSame(0, $config->fingerprintCap);
+        self::assertSame(0, $config->fingerprintWindowMs);
+        self::assertSame([], $written->matching('is used instead'));
     }
 }
