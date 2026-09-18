@@ -50,16 +50,177 @@ final class ConfigParityTest extends TestCase
         'enabled' => 'derived from the three above, not a value an operator sets on its own',
     ];
 
-    /** @return array<string, mixed> */
-    private function sharedList(): array
+    /**
+     * The keys of `config-defaults.json` that are NOT parameters, and so are no part of the name-and-value
+     * contract the two tests below enforce.
+     *
+     * Each of them is held to something of its own instead — `testTheEnvBlockNamesTheVariablesThisSdkReads`
+     * and `testTheLanguageSpecificBlockAgreesWithThisSdksExemptions`, mirroring the Java twin's
+     * `NOT_A_PARAMETER`. That pairing is the rule this list carries: a name added here without a test added
+     * with it turns a contract file into a file with prose in it, and prose in a contract is what goes
+     * quietly wrong while every guard stays green.
+     */
+    private const NOT_A_PARAMETER = ['note', 'env', 'language_specific'];
+
+    /**
+     * The exemptions that are NOT a language decision: three parameters with no default at all, and one
+     * derived from them. Separating them out is what lets the `language_specific` test say anything about
+     * the rest — without it, "exempt" would be one word covering two entirely different reasons.
+     *
+     * PHP has no language-decision exemption today, which is the same statement as "PHP is the language
+     * `in_app_packages` is missing from", and the test below is where that stops being true silently.
+     */
+    private const NO_DEFAULT_OR_DERIVED = ['token', 'service', 'release', 'enabled'];
+
+    /** The whole contract file, blocks included. @return array<string, mixed> */
+    private function contractFile(): array
     {
         $raw = file_get_contents(self::REPOSITORY . '/conformance/config-defaults.json');
         self::assertIsString($raw, 'conformance/config-defaults.json is the contract; it must be readable');
         $decoded = json_decode($raw, true, 512, JSON_THROW_ON_ERROR);
         self::assertIsArray($decoded);
-        unset($decoded['note']);
 
         return $decoded;
+    }
+
+    /** @return array<string, mixed> */
+    private function sharedList(): array
+    {
+        $decoded = $this->contractFile();
+        foreach (self::NOT_A_PARAMETER as $block) {
+            unset($decoded[$block]);
+        }
+
+        return $decoded;
+    }
+
+    /** The promoted constructor parameters of `Config`, in the shared list's snake_case spelling. */
+    private function knobsOfThisSdk(): array
+    {
+        $constructor = (new \ReflectionClass(Config::class))->getConstructor();
+        self::assertNotNull($constructor);
+
+        $knobs = [];
+        foreach ($constructor->getParameters() as $parameter) {
+            $knobs[] = strtolower((string) preg_replace('/(?<!^)[A-Z]/', '_$0', $parameter->getName()));
+        }
+
+        return $knobs;
+    }
+
+    /**
+     * The `env` block of `config-defaults.json`, held against what this SDK actually reads out of the
+     * process environment: every variable the block names is set ON ITS OWN and the parameter the block
+     * says it fills has to come back carrying it.
+     *
+     * `testTheEnvironmentVariableNamesAreTheOnesJavaReads` pins two of the names inside this class with a
+     * data provider. This one pins the FILE, and it drives all five, because the file is what the other
+     * language's twin reads and what an operator consults — and until this test existed the block could
+     * have named a sixth variable, or misspelled one of the five, with nothing anywhere going red.
+     *
+     * The opposite direction — "this SDK reads a variable the block does not name" — cannot be measured
+     * from here: `Config::fromEnvironment` calls `getenv` directly and a test cannot record which names it
+     * asked for. The Java twin CAN (it takes the lookup as a function) and does, in
+     * `theEnvBlockNamesTheFiveVariablesThisSdkReads`. Between the two the contract is closed from both
+     * sides; from this side alone it is not, and saying so is cheaper than a proof that does not exist.
+     */
+    public function testTheEnvBlockNamesTheVariablesThisSdkReads(): void
+    {
+        $block = $this->contractFile()['env'];
+        self::assertIsArray($block);
+        unset($block['note']);
+
+        $knobs = $this->knobsOfThisSdk();
+        $probes = [
+            'endpoint' => 'https://ingest.example/api/feed',
+            'token' => 'anv_srv_0123456789abcdef0123456789abcdef',
+            'service' => 'shop-api',
+            'environment' => 'staging',
+            'release' => 'v1.2.3',
+        ];
+
+        self::assertSame(
+            array_keys($probes),
+            array_values($block),
+            'the env block maps its variables onto a different set of parameters than this test drives'
+        );
+
+        foreach ($block as $name => $parameter) {
+            self::assertContains($parameter, $knobs, $name . ' is mapped onto a parameter Config has not got');
+
+            $saved = getenv($name);
+            putenv($name . '=' . $probes[$parameter]);
+            try {
+                $config = Config::fromEnvironment([], new Logger(new RecordingLogger()));
+                self::assertSame(
+                    $probes[$parameter],
+                    $config->{$parameter},
+                    $name . ' is named in conformance/config-defaults.json but is not read into ' . $parameter
+                );
+            } finally {
+                if ($saved === false) {
+                    putenv($name);
+                } else {
+                    putenv($name . '=' . $saved);
+                }
+            }
+        }
+    }
+
+    /**
+     * The `language_specific` block, held against what this SDK actually has.
+     *
+     * An entry that does NOT name php is a claim about this SDK — "PHP has no such knob" — and it is
+     * checked as one: the parameter must genuinely be absent from `Config`. That is the assertion that
+     * reddens on the day somebody gives PHP a namespace equivalent of `in_app_packages` and leaves the
+     * shared file saying Java-only; the Java twin's half of the same guard reddens on the day the
+     * exemption is dropped there. Neither language can see the other, so each holds its own end.
+     *
+     * An entry naming both languages is the opposite claim — a parameter of the list whose meaning is the
+     * same on both sides — and it has to be in the shared list and say so.
+     */
+    public function testTheLanguageSpecificBlockAgreesWithThisSdksExemptions(): void
+    {
+        $block = $this->contractFile()['language_specific'];
+        self::assertIsArray($block);
+        unset($block['note']);
+
+        $knobs = $this->knobsOfThisSdk();
+        $listed = array_keys($this->sharedList());
+        $phpOnly = [];
+
+        foreach ($block as $parameter => $entry) {
+            self::assertIsArray($entry);
+            self::assertNotEmpty($entry['languages'] ?? [], $parameter . ' names no language, so it says nothing at all');
+            $languages = $entry['languages'];
+
+            if (!in_array('php', $languages, true)) {
+                self::assertNotContains(
+                    $parameter,
+                    $knobs,
+                    $parameter . ' is declared to exist in ' . implode(', ', $languages) . ' only, and this '
+                    . 'SDK has it — move it into the parameter list of conformance/config-defaults.json and '
+                    . 'out of language_specific, in one change with the other language'
+                );
+                continue;
+            }
+
+            if ($languages === ['php']) {
+                $phpOnly[] = $parameter;
+                continue;
+            }
+
+            self::assertContains($parameter, $listed, $parameter . ' is called shared but the parameter list does not carry it');
+            self::assertSame('identical', $entry['semantics'] ?? null, $parameter . ' claims both languages '
+                . 'without claiming they mean the same thing, which is the one thing a reader consults this '
+                . 'block for');
+        }
+
+        $expected = array_values(array_diff(array_keys(self::NOT_IN_THE_SHARED_LIST), self::NO_DEFAULT_OR_DERIVED));
+        sort($expected);
+        sort($phpOnly);
+        self::assertSame($expected, $phpOnly, 'a knob exempt from the shared list for being PHP-only has to '
+            . 'say so in conformance/config-defaults.json, and nothing else may claim to be');
     }
 
     /**
@@ -131,17 +292,11 @@ final class ConfigParityTest extends TestCase
      */
     public function testEveryKnobOfThisSdkIsNamedInTheSharedList(): void
     {
-        $constructor = (new \ReflectionClass(Config::class))->getConstructor();
-        self::assertNotNull($constructor);
-
-        $knobs = [];
-        foreach ($constructor->getParameters() as $parameter) {
-            $snake = strtolower((string) preg_replace('/(?<!^)[A-Z]/', '_$0', $parameter->getName()));
-            if (isset(self::NOT_IN_THE_SHARED_LIST[$parameter->getName()])) {
-                continue;
-            }
-            $knobs[] = $snake;
-        }
+        $exempt = array_map(
+            static fn (string $name): string => strtolower((string) preg_replace('/(?<!^)[A-Z]/', '_$0', $name)),
+            array_keys(self::NOT_IN_THE_SHARED_LIST)
+        );
+        $knobs = array_values(array_diff($this->knobsOfThisSdk(), $exempt));
         sort($knobs);
         $listed = array_keys($this->sharedList());
         sort($listed);
