@@ -173,8 +173,7 @@ final class EventFactory
             $payload['request'] = array_filter([
                 'method' => $context['request']['method'] ?? null,
                 'url' => is_string($url) ? $url : null,
-                'status_code' => isset($context['request']['status_code'])
-                    ? (int) $context['request']['status_code'] : null,
+                'status_code' => self::asInteger($context['request']['status_code'] ?? null),
             ], static fn ($v) => $v !== null);
         }
         if (isset($context['user_id']) && is_string($context['user_id']) && $context['user_id'] !== '') {
@@ -447,6 +446,30 @@ final class EventFactory
             fn (string $l) => mb_substr($l, 0, $this->config->maxContextLineChars),
             $slice
         ));
+    }
+
+    /**
+     * schema 1.0 types `request.status_code` as an INTEGER, and a value that is not one is not a status
+     * code. `(int)` read `"12abc"` as 12 and `"abc"` as 0 — a status nobody ever sent, shown in a cockpit
+     * as fact, and `0` is exactly the shape a reader takes for "the request never completed". A filter
+     * that read the status off a header, or a value that took a JSON or properties hop, legitimately hands
+     * over the string `"500"`, so a string of digits is accepted; anything else is DROPPED. One member of
+     * an optional block is a cheaper loss than a guessed one — and shipping it as a string would cost the
+     * whole event a `schema_violation`. This is the Java core's `asInteger()` (task-6 review finding 2),
+     * rule for rule, so that C9/C17 hold here too.
+     *
+     * @return int|null the status as the schema's integer, or null when it is not one
+     */
+    private static function asInteger(mixed $value): ?int
+    {
+        if (is_int($value)) {
+            return $value;
+        }
+        if (is_string($value) && preg_match('/^-?\d+$/', trim($value)) === 1) {
+            return (int) trim($value);
+        }
+
+        return null;
     }
 
     private function title(string $type, string $message): string

@@ -8,6 +8,7 @@ use AnvilFeed\Config;
 use AnvilFeed\EventFactory;
 use AnvilFeed\GitContext;
 use AnvilFeed\Scrubber;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
 final class EventFactoryTest extends TestCase
@@ -292,4 +293,48 @@ final class EventFactoryTest extends TestCase
         self::assertArrayHasKey('context_code', $inApp[0], 'the crash site keeps its context code');
     }
 
+    /**
+     * schema 1.0 types `request.status_code` as an INTEGER, and a value that is not one is not a status
+     * code. The `(int)` cast read `"12abc"` as 12 and `"abc"` as 0 — a status nobody ever sent, shown in a
+     * cockpit as fact, and `0` is the shape a reader takes for "the request never completed". The Java
+     * core requires the whole string to be an optional minus followed by digits and DROPS anything else
+     * (`EventFactory.asInteger()`, task-6 review finding 2); one member of an optional block is a cheaper
+     * loss than a guessed one. C9/C17: the same rule in both languages.
+     *
+     * @param mixed $given
+     */
+    #[DataProvider('everyShapeAStatusCodeArrivesIn')]
+    public function testAStatusCodeThatIsNotAnIntegerIsDroppedRatherThanGuessed(
+        mixed $given,
+        ?int $expected,
+    ): void {
+        $request = $this->factory()->fromThrowable(new \RuntimeException('boom'), 'error', [
+            'request' => ['method' => 'GET', 'url' => 'https://app.example/x', 'status_code' => $given],
+        ])->payload['request'];
+
+        if ($expected === null) {
+            self::assertArrayNotHasKey('status_code', $request,
+                'a status code that is not an integer was guessed at rather than dropped');
+
+            return;
+        }
+        self::assertSame($expected, $request['status_code']);
+    }
+
+    /** @return array<string, array{0: mixed, 1: ?int}> */
+    public static function everyShapeAStatusCodeArrivesIn(): array
+    {
+        return [
+            'an integer'                => [404, 404],
+            'a numeric string'          => ['404', 404],
+            'a numeric string, padded'  => ['  404  ', 404],
+            'a negative integer string' => ['-1', -1],
+            'digits with a tail'        => ['12abc', null],
+            'not a number at all'       => ['abc', null],
+            'a decimal string'          => ['200.5', null],
+            'the empty string'          => ['', null],
+            'a boolean'                 => [true, null],
+            'an array'                  => [[500], null],
+        ];
+    }
 }
