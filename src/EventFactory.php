@@ -414,7 +414,9 @@ final class EventFactory
     {
         $frame = ['file' => $file, 'line' => max(0, $line), 'function' => $function];
         $frame['in_app'] = self::isInApp($file);
-        $context = $this->contextCode($file, $line);
+        // in_app frames only: a vendor frame's source lines cost a file read per frame in the request path
+        // (measured 12.4 ms for ten captures, task-5 review) and tell a repair agent nothing it can change.
+        $context = $frame['in_app'] ? $this->contextCode($file, $line) : null;
         if ($context !== null) {
             $frame['context_code'] = $context;
         }

@@ -273,4 +273,23 @@ final class EventFactoryTest extends TestCase
             'frames keep the HEAD: the stack is most-recent-first and frame 0 is the crash site');
         self::assertSame('app/Frame50.php', $finalised['exception']['stacktrace'][49]['file']);
     }
+    /**
+     * Context code is read for in_app frames ONLY (task-5 review, finding 9): the source lines of a vendor
+     * frame cost a file read per frame in the request path and tell a repair agent nothing it can change.
+     * The test process itself supplies the vendor frames — PHPUnit's own — and this file the in_app one.
+     */
+    public function testContextCodeIsReadForInAppFramesOnly(): void
+    {
+        $frames = $this->factory()->fromThrowable(new \RuntimeException('boom'))->payload['exception']['stacktrace'];
+
+        $vendor = array_values(array_filter($frames, static fn (array $f) => $f['in_app'] === false));
+        $inApp = array_values(array_filter($frames, static fn (array $f) => $f['in_app'] === true));
+        self::assertNotEmpty($vendor, 'PHPUnit frames are vendor frames — the precondition of this test');
+        self::assertNotEmpty($inApp, 'this test file is an in_app frame');
+        foreach ($vendor as $frame) {
+            self::assertArrayNotHasKey('context_code', $frame, 'a vendor frame carries no context code: ' . $frame['file']);
+        }
+        self::assertArrayHasKey('context_code', $inApp[0], 'the crash site keeps its context code');
+    }
+
 }
