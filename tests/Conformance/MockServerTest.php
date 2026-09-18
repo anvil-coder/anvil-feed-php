@@ -106,7 +106,7 @@ final class MockServerTest extends TestCase
     {
         $index = json_decode((string) file_get_contents(self::RESPONSES . '/index.json'), true);
         self::assertIsArray($index);
-        self::assertGreaterThanOrEqual(9, count($index), 'conformance/responses/index.json lost entries');
+        self::assertGreaterThanOrEqual(12, count($index), 'conformance/responses/index.json lost entries');
 
         $cases = [];
         foreach ($index as $entry) {
