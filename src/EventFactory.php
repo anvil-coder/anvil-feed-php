@@ -25,6 +25,16 @@ final class EventFactory
      */
     public const SDK_VERSION = '0.1.0';
 
+    /**
+     * The User-Agent BOTH transports send, derived here so the version is spelled once in this SDK
+     * (C18, review finding 5). It used to be a literal in DirectTransport and another in PsrTransport:
+     * at the first real tag `sdk.version` on the wire and the User-Agent beside it would have disagreed
+     * unless three files were edited by hand, and the only guard that would have noticed is
+     * `conformance/stub/compare.mjs` — after the tag, in CI, by accident.
+     * `conformance/tools/version-pins.mjs` now reads this constant and holds the whole of php/ to it.
+     */
+    public const USER_AGENT = 'anvil-feed-php/' . self::SDK_VERSION;
+
     public const MESSAGE_TYPE = 'AnvilFeed.Message';
     public const TEST_TYPE = 'AnvilFeed.TestEvent';
     public const TEST_MESSAGE = 'This event was produced by captureTestEvent() to verify the integration. '

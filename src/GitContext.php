@@ -61,6 +61,10 @@ final class GitContext
             if (is_dir($candidate)) {
                 return $candidate;
             }
+            $linked = self::linkedGitDirectory($candidate);
+            if ($linked !== null) {
+                return $linked;
+            }
             $parent = dirname($directory);
             if ($parent === $directory) {
                 return null;
@@ -69,6 +73,47 @@ final class GitContext
         }
 
         return null;
+    }
+
+    /**
+     * A `.git` that is a FILE rather than a directory (review finding 11). A `git worktree` checkout and
+     * a submodule deployment both have one, and it holds a single line:
+     *
+     *     gitdir: /srv/app/.git/worktrees/release
+     *
+     * Without this, `release` and `agent_context.repo/branch` were simply absent on both — FR-6 b's
+     * "filled where determinable" quietly reading "filled where the layout is the common one", and those
+     * two layouts are exactly the ones that are deployments.
+     *
+     * Followed ONCE, deliberately: git does not write a gitdir that points at another gitdir, and a chain
+     * is how a symlink loop gets into a path Z4 budgets a millisecond for. A relative pointer is resolved
+     * against the directory holding the `.git` file, which is how a submodule writes it.
+     *
+     * What this does NOT do: in a worktree the loose refs and `config` live in the MAIN repository's git
+     * directory, so `repo` and a branch's sha can still be null there. Nothing is guessed to cover that
+     * (FR-6 c) — a DETACHED worktree, which is what a deployment checkout normally is, carries its sha in
+     * its own HEAD and is answered in full.
+     */
+    private static function linkedGitDirectory(string $dotGit): ?string
+    {
+        $pointer = self::readFile($dotGit);
+        if ($pointer === null) {
+            return null;
+        }
+        $firstLine = trim(explode("\n", $pointer)[0]);
+        if (!str_starts_with($firstLine, 'gitdir:')) {
+            return null;
+        }
+        $target = trim(substr($firstLine, strlen('gitdir:')));
+        if ($target === '') {
+            return null;
+        }
+        if (!str_starts_with($target, '/')) {
+            $target = dirname($dotGit) . '/' . $target;
+        }
+        $resolved = realpath($target);
+
+        return $resolved !== false && is_dir($resolved) ? $resolved : null;
     }
 
     /** A packed-refs checkout has no loose ref file for the branch. */

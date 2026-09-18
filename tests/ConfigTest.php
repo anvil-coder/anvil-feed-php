@@ -209,12 +209,20 @@ final class ConfigTest extends TestCase
         self::assertStringContainsString('start with a lower-case letter', $lines[0]);
     }
 
-    public function testAnEmptyEnvironmentDisablesTheClient(): void
+    /**
+     * REVERSED by review finding 4, deliberately. A blank is not a value that cannot be repaired, it is
+     * an UNSET one — an empty placeholder line in a .env, which `env()` hands over as '' — and Java's
+     * builder has always kept the default for it and sent under `production`. Disabling the SDK where
+     * the other language reports normally is the drift C9/C17 forbid, and it did so with a line telling
+     * the reader that "" does not match a pattern.
+     */
+    public function testAnEmptyEnvironmentIsTheDefaultRatherThanADisabledClient(): void
     {
         [$config, $lines] = $this->valid(['environment' => '   ']);
 
-        self::assertFalse($config->enabled);
-        self::assertCount(1, $lines);
+        self::assertSame('production', $config->environment);
+        self::assertTrue($config->enabled);
+        self::assertCount(0, $lines, 'nothing was repaired, so there is nothing to announce');
     }
 
     // ------------------------------------------------------------ token and service
@@ -669,6 +677,31 @@ final class ConfigTest extends TestCase
             'fingerprint_cap negative' => ['fingerprint_cap', -1],
             'fingerprint_window_ms negative' => ['fingerprint_window_ms', -60000],
         ];
+    }
+
+    /**
+     * Review finding 4. Java's builder "ignores a null or blank value and keeps the default, which is
+     * what a host framework hands over for an unset property"; PHP accepted the blank. The two knobs
+     * that go through `stringOption` are the two that hurt: an endpoint of '' makes `eventsUrl()`
+     * `/events` and backs the sender off for ever, and an environment of '' DISABLED the SDK where Java
+     * sends under `production`.
+     */
+    public function testABlankStringOptionIsTheDefaultAsInJava(): void
+    {
+        $written = new \AnvilFeed\Tests\Support\RecordingLogger();
+        $config = Config::fromArray([
+            'token' => 'anv_srv_0123456789abcdef0123456789abcdef',
+            'service' => 'disponio-api',
+            'endpoint' => '',
+            'environment' => '   ',
+        ], new Logger($written));
+
+        self::assertSame(Config::DEFAULT_ENDPOINT, $config->endpoint);
+        self::assertSame(Config::DEFAULT_ENDPOINT . '/events', $config->eventsUrl());
+        self::assertSame('production', $config->environment);
+        self::assertTrue($config->enabled, 'a blank line in a .env may not switch the SDK off');
+        self::assertSame([], $written->matching('cannot be made to match'),
+            'nothing was repaired, so there is nothing to announce');
     }
 
     /**

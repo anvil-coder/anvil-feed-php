@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace AnvilFeed\Transport;
 
 use AnvilFeed\Config;
+use AnvilFeed\EventFactory;
 
 /**
  * The bundled fallback, used when the host application injects no PSR-18 client: curl where ext-curl is
@@ -32,7 +33,8 @@ use AnvilFeed\Config;
  */
 final class DirectTransport implements Transport
 {
-    private const USER_AGENT = 'anvil-feed-php/0.1.0';
+    /** {@see EventFactory::USER_AGENT} — derived from the one version constant, never spelled. */
+    private const USER_AGENT = EventFactory::USER_AGENT;
     /** A budget below this is not a request, it is a failure that costs a socket. */
     private const MINIMUM_BUDGET_MS = 1;
 

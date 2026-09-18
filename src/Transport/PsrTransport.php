@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace AnvilFeed\Transport;
 
 use AnvilFeed\Config;
+use AnvilFeed\EventFactory;
 use Psr\Http\Client\ClientExceptionInterface;
 use Psr\Http\Client\ClientInterface;
 use Psr\Http\Message\RequestFactoryInterface;
@@ -38,7 +39,7 @@ final class PsrTransport implements Transport
             $request = $this->requests->createRequest('POST', $url)
                 ->withHeader('Content-Type', 'application/json')
                 ->withHeader('Authorization', 'Bearer ' . ($this->config->token ?? ''))
-                ->withHeader('User-Agent', 'anvil-feed-php/0.1.0')
+                ->withHeader('User-Agent', EventFactory::USER_AGENT)
                 ->withHeader('Accept', 'application/json')
                 ->withBody($this->streams->createStream($body));
 

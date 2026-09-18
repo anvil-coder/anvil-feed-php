@@ -258,7 +258,17 @@ final class Config
             return $default;
         }
         if (is_string($options[$key])) {
-            return trim($options[$key]);
+            $trimmed = trim($options[$key]);
+
+            // A BLANK value is the default, exactly as `AnvilFeedConfig.Builder` treats one: "every
+            // setter ignores a null or blank value and keeps the default, which is what a host framework
+            // hands over for an unset property" (review finding 4). An empty placeholder line in a .env
+            // is the ordinary way a customer produces one — Laravel's env() substitutes the default only
+            // for an ABSENT variable, never for `ANVIL_INGEST_ENDPOINT=` — and `endpoint: ''` made
+            // eventsUrl() `/events`, which every transport refuses as "not a usable URL": a backoff that
+            // never recovers, on one line, for a line somebody left in a file. `environment: ''` was the
+            // same class the other way: it DISABLED the SDK where Java sends under `production`.
+            return $trimmed === '' ? $default : $trimmed;
         }
         self::sayItIsUnreadable($key, $options[$key], 'a string', $default, $logger);
 
