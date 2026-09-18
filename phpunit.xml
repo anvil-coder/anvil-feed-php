@@ -10,6 +10,12 @@
     <testsuite name="unit">
       <directory>tests</directory>
       <exclude>tests/Conformance</exclude>
+      <exclude>tests/EndToEnd</exclude>
+    </testsuite>
+    <!-- The whole SDK against conformance/stub/server.mjs, the replay of the PUBLISHED ingest contract.
+         Needs node 22+ on PATH; it fails rather than skips without one. -->
+    <testsuite name="endtoend">
+      <directory>tests/EndToEnd</directory>
     </testsuite>
     <testsuite name="conformance">
       <directory>tests/Conformance</directory>
