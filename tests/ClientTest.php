@@ -492,11 +492,28 @@ final class ClientTest extends TestCase
     {
         $sink = new RecordingLogger();
         $client = $this->client([], null, new Logger($sink));
-        $client->beforeSend(static fn (array $payload) => array_diff_key($payload, ['level' => 1]));
+        // `language`, not `level`: a removed or foreign level is REPAIRED by the second pass (coerced to
+        // `error`, see EventFactory::coerceLevel), and `title` is read-only and restored — `language` is a
+        // required field the pass neither restores nor repairs, so it still stands for a broken contract.
+        $client->beforeSend(static fn (array $payload) => array_diff_key($payload, ['language' => 1]));
 
         self::assertNull($client->captureException(new \RuntimeException('boom')));
         self::assertSame(0, $client->queue()->count());
-        self::assertCount(1, $sink->matching('beforeSend returned an event without level'));
+        self::assertCount(1, $sink->matching('beforeSend returned an event without language'));
+    }
+
+    /** The sibling of the test above: a level the wire does not know is not a broken contract but an error. */
+    public function testAHookThatSetsAnUnknownLevelSendsTheEventAsAnError(): void
+    {
+        $client = $this->client();
+        $client->beforeSend(static function (array $payload): array {
+            $payload['level'] = 'info';
+
+            return $payload;
+        });
+
+        self::assertNotNull($client->captureException(new \RuntimeException('boom')));
+        self::assertSame('error', $client->queue()->take(1)[0]->payload['level']);
     }
 
     // ------------------------------------------------- the injected clock (finding 5)

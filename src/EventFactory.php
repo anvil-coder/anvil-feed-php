@@ -153,7 +153,7 @@ final class EventFactory
             // title is required and must not be blank. A caught exception with no message and an empty
             // log line are both real calls, and neither may cost the event.
             'title' => trim($title) === '' ? $exception['type'] : $title,
-            'level' => in_array($level, ['error', 'warning', 'fatal'], true) ? $level : 'error',
+            'level' => self::coerceLevel($level),
             'environment' => $this->config->environment,
             'service' => $this->config->service,
             'language' => $this->language,
@@ -230,7 +230,19 @@ final class EventFactory
      */
     public function finalise(array $payload): array
     {
-        return $this->dropUnsendable($this->boundTexts($this->scrubber->scrub($payload)));
+        $payload = $this->dropUnsendable($this->boundTexts($this->scrubber->scrub($payload)));
+        // The level enum is re-applied HERE and not only in build(): finalise() is also the second pass a
+        // beforeSend result takes, and a hook that writes `level: "info"` used to reach the wire — the
+        // ingest stores it, so nothing complains (sdk-forbidden/level-info.json, task-4 fix round).
+        $payload['level'] = self::coerceLevel($payload['level'] ?? null);
+
+        return $payload;
+    }
+
+    /** The wire's level enum; anything else is an error, which is what an unknown severity means to a repair. */
+    public static function coerceLevel(mixed $level): string
+    {
+        return in_array($level, ['error', 'warning', 'fatal'], true) ? $level : 'error';
     }
 
     /**

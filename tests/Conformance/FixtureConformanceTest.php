@@ -506,6 +506,18 @@ final class FixtureConformanceTest extends TestCase
                 return $payload;
             })
         );
+        // The one member the second pipeline pass did NOT re-check (task-4 fix round, 02:31): a level outside
+        // the wire enum. The ingest stores it, so nothing on the wire complains — exactly the
+        // sdk-forbidden/level-info.json failure mode, and beforeSend is the only public route to it.
+        yield 'a beforeSend hook that sets a level the wire does not know' => $this->captured(
+            fn (Client $c) => $c->captureException(new \DomainException('boom')),
+            [],
+            static fn (Client $c) => $c->beforeSend(static function (array $payload): array {
+                $payload['level'] = 'info';
+
+                return $payload;
+            })
+        );
         yield 'a beforeSend hook that adds secrets and rewrites what the SDK owns' => $this->captured(
             fn (Client $c) => $c->captureException(new \OutOfBoundsException('boom')),
             [],
