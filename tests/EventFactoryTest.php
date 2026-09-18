@@ -194,4 +194,29 @@ final class EventFactoryTest extends TestCase
 
         self::assertStringStartsWith('{"schema_version":"1.0","event_id":"', $json);
     }
+
+    /**
+     * `finalise()` is public precisely so that a `beforeSend` hook's output takes the same pipeline as the
+     * payload this factory built, and its docblock promises the second pass "cannot double-filter". It could:
+     * the scrubber's already-filtered guard let a quoted marker through, so every quoted secret in the
+     * message, in a breadcrumb and in every tag grew by two characters on the second pass — after the caps of
+     * the first pass and before those of the second, so only the second bound kept the event legal at all.
+     */
+    public function testFinalisingAnAlreadyFinalisedPayloadChangesNothing(): void
+    {
+        $factory = $this->factory(['context_lines' => 0]);
+        $payload = $factory->fromThrowable(
+            new \RuntimeException('cfg token="abc123" and $api_key = \'sk-live-99887766\'; failed'),
+            'error',
+            [
+                'tags' => ['note' => 'password="hunter2"', 'tenant' => 'kunde-x'],
+                'breadcrumbs' => ['GET /callback?token=abc123', "config: secret='shh' loaded"],
+            ]
+        )->payload;
+
+        self::assertStringContainsString('token="[Filtered]"', $payload['exception']['message'],
+            'the first pass must have scrubbed the quoted value, or this guard proves nothing');
+        self::assertSame($payload, $factory->finalise($payload),
+            'a second pass over an already finalised payload changed it');
+    }
 }

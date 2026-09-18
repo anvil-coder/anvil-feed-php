@@ -49,8 +49,17 @@ final class Scrubber
             static fn (string $term) => str_replace('_', '[-_ ]?', preg_quote($term, '/')),
             $terms
         ));
-        $this->textPattern = '/\b(' . $alternatives . ')\b(\s*[:=]\s*)'
-            . '(?!' . preg_quote(self::FILTERED, '/') . ')(?!Bearer\b)(["\']?)([^\s"\',;&)}\]]+)\3?/i';
+        // The quote group comes BEFORE the two lookaheads, and that order is the whole of the fix. With the
+        // guard in front, a second pass over `token="[Filtered]"` read the lookahead against the QUOTE —
+        // which is not `[Filtered]`, so it passed — the value class then stopped at the `]` it excludes, and
+        // the leftover `]"` survived in the tail: `token="[Filtered]"]"`, two more characters on every
+        // further pass. Behind the quote the guard sees the value a reader sees, so an already-filtered
+        // value (quoted or not) matches nothing and comes back byte-identical, and `Authorization: "Bearer
+        // [Filtered]"` keeps the scheme the line above deliberately kept. The value class stays the server's
+        // own (IncidentRedaction.KV_SECRET): excluding `)}]` is what keeps `(token=abc)` from losing its
+        // bracket, and it is also the reason the guard cannot be left where it was.
+        $this->textPattern = '/\b(' . $alternatives . ')\b(\s*[:=]\s*)(["\']?)'
+            . '(?!' . preg_quote(self::FILTERED, '/') . ')(?!Bearer\b)([^\s"\',;&)}\]]+)\3?/i';
     }
 
     /**

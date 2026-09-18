@@ -8,6 +8,7 @@ use AnvilFeed\Config;
 use AnvilFeed\EventFactory;
 use AnvilFeed\GitContext;
 use AnvilFeed\Scrubber;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
 final class ScrubberTest extends TestCase
@@ -195,5 +196,91 @@ final class ScrubberTest extends TestCase
         self::assertStringContainsString('&user=7', $json);
         self::assertStringContainsString('"id":"u-4711"', $json);
         self::assertStringContainsString('"url":"https://app.example/login?', $json);
+    }
+
+    /**
+     * Finding 1 of the Java core's task-6 review, true of this file for the same reason: the already-filtered
+     * guard sat IN FRONT of the optional quote group, so on a second pass over `token="[Filtered]"` the
+     * lookahead only ever saw the quote, the value class stopped at the `]` it excludes, and the leftover
+     * `]"` survived in the tail.
+     *
+     * The second pass is not hypothetical. `EventFactory::finalise()` runs scrub -> bound -> prune over a
+     * `beforeSend` result that this SDK has already scrubbed once, and its docblock promises that the second
+     * pass "cannot double-filter". Every quoted secret in an exception message, a breadcrumb or a tag grew by
+     * two characters per pass, in the one form every JSON, YAML, .env and config line uses.
+     *
+     * Driven by the language-independent corpus so that Java's guard and this one measure the same bytes.
+     */
+    public function testScrubbingTheConformanceCorpusTwiceChangesNothingTheSecondTime(): void
+    {
+        $raw = json_decode(file_get_contents(self::CONFORMANCE . '/pii/raw.json'), true, 512, JSON_THROW_ON_ERROR);
+
+        $once = $this->scrubber()->scrub($raw);
+
+        self::assertSame($once, $this->scrubber()->scrub($once),
+            'a second pass over an already scrubbed payload changed it');
+    }
+
+    /**
+     * Every shape the PII guards in this file cover, as INPUT and as the exact text one pass must produce.
+     * The first assertion is what keeps the second honest: a row whose first pass stopped scrubbing would
+     * be trivially idempotent and would prove nothing.
+     *
+     * @return array<string, array{string, string}>
+     */
+    public static function everyShapeTheDenylistReaches(): array
+    {
+        return [
+            'key=value'                  => ['token=abc123', 'token=[Filtered]'],
+            'key: value'                 => ['token: abc123', 'token: [Filtered]'],
+            'a double-quoted value'      => ['config: token="abc123" done', 'config: token="[Filtered]" done'],
+            'a single-quoted value'      => ["\$api_key = 'sk-live-99887766';", "\$api_key = '[Filtered]';"],
+            'a value in parentheses'     => ['(token=abc123)', '(token=[Filtered])'],
+            'two values in one line'     => [
+                'token="abc123"; password=hunter2',
+                'token="[Filtered]"; password=[Filtered]',
+            ],
+            'Authorization: Bearer'      => [
+                'Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.abc',
+                'Authorization: Bearer [Filtered]',
+            ],
+            // Unchanged today, in BOTH languages: the rule needs the separator immediately after the word
+            // boundary and finds a quote instead (finding 14 of the same review, recorded there as a spec
+            // decision rather than a silent fix). What this row guards is only the half this fix owns —
+            // that a second pass does not change it either.
+            'a JSON member'              => ['{"password": "hunter2"}', '{"password": "hunter2"}'],
+            // The four already-filtered forms. These must come back BYTE-IDENTICAL, which is the whole
+            // finding: they are what one pass leaves behind for the next one to read.
+            'an unquoted [Filtered]'     => ['token=[Filtered]', 'token=[Filtered]'],
+            'a double-quoted [Filtered]' => ['config: token="[Filtered]" done', 'config: token="[Filtered]" done'],
+            'a single-quoted [Filtered]' => ["\$api_key = '[Filtered]';", "\$api_key = '[Filtered]';"],
+            'a filtered Bearer'          => ['Authorization: Bearer [Filtered]', 'Authorization: Bearer [Filtered]'],
+        ];
+    }
+
+    #[DataProvider('everyShapeTheDenylistReaches')]
+    public function testOnePassScrubsAndEveryFurtherPassLeavesTheTextByteIdentical(
+        string $input,
+        string $expectedOnce,
+    ): void {
+        $scrubber = $this->scrubber();
+
+        $once = $scrubber->scrubText($input);
+        self::assertSame($expectedOnce, $once, 'the first pass did not produce what this row is named after');
+
+        $twice = $scrubber->scrubText($once);
+        self::assertSame($once, $twice, 'the second pass changed an already scrubbed text');
+        self::assertSame($once, $scrubber->scrubText($twice), 'the third pass changed it');
+    }
+
+    /** The query-string and userinfo half of the same promise: one pass scrubs, every further pass is a no-op. */
+    public function testAScrubbedUrlSurvivesEveryFurtherPassUnchanged(): void
+    {
+        $scrubber = $this->scrubber();
+
+        $once = $scrubber->scrubUrl('https://admin:hunter2@app.example/reset?token=abc123&user=7#section-2');
+
+        self::assertSame('https://[Filtered]@app.example/reset?token=[Filtered]&user=7#section-2', $once);
+        self::assertSame($once, $scrubber->scrubUrl($once), 'the second pass changed an already scrubbed URL');
     }
 }
