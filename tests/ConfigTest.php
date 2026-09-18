@@ -6,6 +6,7 @@ namespace AnvilFeed\Tests;
 
 use AnvilFeed\Config;
 use AnvilFeed\Logger;
+use AnvilFeed\Scrubber;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\AbstractLogger;
@@ -339,6 +340,56 @@ final class ConfigTest extends TestCase
         );
 
         self::assertSame(['token', 'iban'], $config->denylist);
+    }
+
+    /**
+     * An empty denylist is HONOURED — no key rule at all, rather than a rule that matches everywhere, which
+     * is what an empty alternation compiles to (Scrubber, task-6 review finding 7). But it is also the one
+     * configuration that quietly removes FR-5's whole key-based defence, and a customer who wrote
+     * `'denylist' => []` to drop one term wrote it for all nine. The Java core says so once at build time
+     * (AnvilFeedConfig.build, `denylistCleared`); saying it in one language only is the semantic drift C9
+     * and C17 forbid, and the silent language is the one where the mistake costs a leak.
+     */
+    public function testAnEmptyDenylistIsHonouredAndSaidOnce(): void
+    {
+        [$logger, $lines] = $this->recordingLogger();
+        $config = Config::fromArray(
+            ['token' => 'anv_srv_x', 'service' => 'svc', 'denylist' => []],
+            $logger
+        );
+        // A second read through the SAME logger must not say it twice: this is an init-time line, and a
+        // host that builds its configuration per request would otherwise flood its own log.
+        Config::fromArray(['token' => 'anv_srv_x', 'service' => 'svc', 'denylist' => []], $logger);
+
+        self::assertSame([], $config->denylist);
+
+        $scrubber = new Scrubber($config->denylist);
+        self::assertSame(
+            'user=alice&mode=fast',
+            $scrubber->scrubText('user=alice&mode=fast'),
+            'the defect an empty alternation produces: every readable key=value destroyed'
+        );
+        self::assertSame(
+            'Authorization: Bearer ' . Scrubber::FILTERED,
+            $scrubber->scrubText('Authorization: Bearer abc.def'),
+            'the absolutes are not configurable and keep running'
+        );
+
+        self::assertCount(1, $lines, 'said once per logger, which is once per process');
+        self::assertStringContainsString('the denylist is empty', $lines[0]);
+    }
+
+    /** `null` is "not configured" and keeps the nine terms; only an explicit empty list turns them off. */
+    public function testANullDenylistIsNotAnEmptyOne(): void
+    {
+        [$logger, $lines] = $this->recordingLogger();
+        $config = Config::fromArray(
+            ['token' => 'anv_srv_x', 'service' => 'svc', 'denylist' => null],
+            $logger
+        );
+
+        self::assertSame(Config::DEFAULT_DENYLIST, $config->denylist);
+        self::assertCount(0, $lines);
     }
 
     /**

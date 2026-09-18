@@ -99,6 +99,20 @@ final class Config
             $enabled = false;
         }
 
+        $denylist = self::listOption($options, 'denylist', self::DEFAULT_DENYLIST, $logger);
+        // The default is never empty, so an empty list here can only be one the operator wrote — which is
+        // why this is not a check on the raw option: `['denylist' => [7, null]]` filters down to nothing and
+        // means exactly the same thing to the scrubber. Honoured, and SAID, because this is the one setting
+        // that removes FR-5's whole key-based defence and does it silently: somebody who wrote it to drop
+        // one term dropped all nine, and would learn that from a leaked value. The Java core says the same
+        // sentence at the same moment (AnvilFeedConfig.build, `denylistCleared`); a warning that exists in
+        // one language only is the drift C9/C17 forbid.
+        if ($denylist === []) {
+            $logger->once('denylist', 'anvil-feed: the denylist is empty, so no value is filtered by its '
+                . 'key any more. Bearer tokens, URL credentials and user.ip are still removed — nothing '
+                . 'else is. Remove the setting to get the nine default terms back.');
+        }
+
         return new self(
             endpoint: rtrim(self::stringOption($options, 'endpoint', self::DEFAULT_ENDPOINT, $logger), '/'),
             token: $token,
@@ -133,7 +147,7 @@ final class Config
             contextLines: min(20, max(0, self::intOption($options, 'context_lines', 20, $logger))),
             maxContextLineChars:
                 min(400, max(1, self::intOption($options, 'max_context_line_chars', 400, $logger))),
-            denylist: self::listOption($options, 'denylist', self::DEFAULT_DENYLIST, $logger),
+            denylist: $denylist,
             enabled: $enabled,
             fingerprintCap: self::atLeastZero(
                 self::intOption($options, 'fingerprint_cap', 10, $logger),
