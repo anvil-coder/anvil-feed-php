@@ -350,6 +350,21 @@ final class EventFactoryTest extends TestCase
             'negative infinity'         => [-INF, null],
             'a float past PHP_INT_MAX'  => [1.0e20, null],
 
+            // The 32-BIT rows. schema 1.0's `integer` is what its readers can actually hold, and PHP's
+            // int is 64-bit, so every branch here needs a bound the language does not give it. Out of
+            // range is DROPPED, never wrapped or saturated: a status nobody sent, shown in a cockpit as
+            // fact, is worse than an absent member of an optional block. Java's asInteger applies the
+            // same single bound to every arm (task-9 parity list).
+            'the largest int32'         => [2147483647, 2147483647],
+            'one past the largest'      => [2147483648, null],
+            'the smallest int32'        => [-2147483648, -2147483648],
+            'one below the smallest'    => [-2147483649, null],
+            'the largest, as a string'  => ['2147483647', 2147483647],
+            'a digit-string past int32' => ['3000000000', null],
+            'more digits than a long'   => ['99999999999999999999999999', null],
+            'the largest, as a float'   => [2147483647.0, 2147483647],
+            'a whole float past int32'  => [3.0e9, null],
+
             'digits with a tail'        => ['12abc', null],
             'not a number at all'       => ['abc', null],
             'a decimal string'          => ['200.5', null],

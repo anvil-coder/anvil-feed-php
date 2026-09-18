@@ -31,6 +31,10 @@ final class EventFactory
         . 'It is safe to ignore or close.';
 
     /** schema 1.0: title 512, exception.message 2000, everything short-text 1000. */
+    /** The range schema 1.0's `integer` readers have; PHP's 64-bit int does not give it for free. */
+    private const INT32_MIN = -2147483648;
+    private const INT32_MAX = 2147483647;
+
     private const MAX_TITLE_CHARS = 512;
     private const MAX_MESSAGE_CHARS = 2000;
     private const MAX_SHORT_TEXT_CHARS = 1000;
@@ -458,33 +462,59 @@ final class EventFactory
      * whole event a `schema_violation`. This is the Java core's `asInteger()` (task-6 review finding 2),
      * rule for rule, so that C9/C17 hold here too.
      *
-     * A FLOAT is only a status code when it IS a whole number. `200.0` is the 200 a JSON or properties hop
-     * turned into a float — every `json_decode` of `{"status_code": 200.0}` hands one over — and dropping
-     * it lost a status the caller did state. `200.5` is not a status at all, and a cast would have shown it
-     * in a cockpit as 200; `NAN` casts to 0, which reads as "the request never completed", and `INF` casts
-     * to PHP_INT_MIN. So: finite, whole, and inside the integer range, or nothing. This is the float branch
-     * the Java core grew in f80e0e1 (task-9 parity list), the same rule the string branch already gives
-     * `"200.5"`.
+     * Two rules, and every branch below shares both.
+     *
+     * INTEGRALITY. A float is only a status code when it IS a whole number. `200.0` is the 200 a JSON or
+     * properties hop turned into a float — every `json_decode` of `{"status_code": 200.0}` hands one over
+     * — and dropping it lost a status the caller did state. `200.5` is not a status at all, and a cast
+     * would have shown it in a cockpit as 200; `NAN` casts to 0, which reads as "the request never
+     * completed", and `INF` casts to PHP_INT_MIN.
+     *
+     * RANGE. A whole number outside a SIGNED 32-BIT int is not one either, and it is DROPPED rather than
+     * wrapped or saturated. PHP's int is 64-bit and its float branch was bounded at PHP_INT_MIN/MAX, so
+     * `3000000000`, `"3000000000"` and `3.0e9` all went out on the wire as a status schema 1.0's readers
+     * cannot hold. Negatives are still kept where they fit (`-1`), because the rule is the int32 range and
+     * not a non-negativity rule — the Java core's `INTEGER` pattern takes an optional minus too.
+     *
+     * So: an integer, a digit string, or a whole finite float, inside {@link withinAnInt32}, or nothing.
+     * This is Java `EventFactory.asInteger` with its shared `withinAnInt` bound, rule for rule
+     * (task-9 parity list); C9/C17.
      *
      * @return int|null the status as the schema's integer, or null when it is not one
      */
     private static function asInteger(mixed $value): ?int
     {
         if (is_int($value)) {
-            return $value;
+            return self::withinAnInt32($value);
         }
         if (is_float($value)) {
-            // The range check is not decoration: casting a float outside the integer range is undefined in
-            // PHP 8 and would invent a status nobody sent — the same reason Java bounds its own float branch.
+            // The integrality check and the range check are both load-bearing: 200.5 must not become 200,
+            // NAN and INF must not become 0 and PHP_INT_MIN, and a float outside the 32-bit range must not
+            // be cast at all. Compared as floats, because 3.0e9 has no int this branch could compare with.
             return is_finite($value) && floor($value) === $value
-                && $value >= (float) PHP_INT_MIN && $value < (float) PHP_INT_MAX
+                && $value >= (float) self::INT32_MIN && $value <= (float) self::INT32_MAX
                     ? (int) $value : null;
         }
         if (is_string($value) && preg_match('/^-?\d+$/', trim($value)) === 1) {
-            return (int) trim($value);
+            // A digit string longer than PHP's int saturates to PHP_INT_MIN/MAX on cast rather than
+            // wrapping, and both ends are outside the 32-bit range, so the bound catches those too.
+            return self::withinAnInt32((int) trim($value));
         }
 
         return null;
+    }
+
+    /**
+     * The ONE 32-bit bound every branch of {@link asInteger} shares — the range schema 1.0's `integer`
+     * readers actually have, which PHP's 64-bit int does not give for free.
+     *
+     * Out of range is DROPPED, never wrapped and never saturated: `status_code` is one member of an
+     * optional block, and losing it costs less than showing 705032704 in a cockpit as a status the caller
+     * never sent. This is Java's `withinAnInt`, and the answer its string branch has always given.
+     */
+    private static function withinAnInt32(int $value): ?int
+    {
+        return $value >= self::INT32_MIN && $value <= self::INT32_MAX ? $value : null;
     }
 
     private function title(string $type, string $message): string
