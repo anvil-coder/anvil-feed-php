@@ -1,5 +1,11 @@
 # anvil-feed-php
 
+> **Read-only mirror.** This repository is the `php/anvil-feed-php` directory of the private
+> `anvil-coder/anvil-feed` monorepo, split on every tag and every push to `main`. Nothing is edited here:
+> a push to this repository is overwritten by the next mirror run. Issues and pull requests go to the
+> monorepo's owners. The `tests/` directory reads the monorepo's `conformance/` fixtures and does not run
+> from this checkout; CI runs in the monorepo. Install with `composer require anvil-coder/anvil-feed-php`.
+
 The Anvil Feed SDK for PHP. It turns an uncaught exception into one event of the Anvil Feed Protocol
 (schema `1.0`) and posts it to the ingest described in `docs/anvil-feed-ingest.md`.
 
