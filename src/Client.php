@@ -56,15 +56,20 @@ final class Client
         ?Logger $logger = null,
         ?GitContext $git = null,
         ?callable $clock = null,
+        ?Release $release = null,
     ): self {
         $logger ??= new Logger();
-        $git ??= GitContext::discover(getcwd() ?: __DIR__);
+        $root = getcwd() ?: __DIR__;
+        $git ??= GitContext::discover($root);
+        // Issue #13: the release falls back past .git to a REVISION/.release file and to the releases/<id>
+        // directory of a zero-downtime deploy. A host framework passes its own root; plain PHP uses cwd.
+        $release ??= Release::discover($config->release, $git, $root);
         $scrubber = new Scrubber($config->denylist);
         $queue = new Queue($config->maxQueueSize, $logger);
 
         return new self(
             $config,
-            new EventFactory($config, $scrubber, $git),
+            new EventFactory($config, $scrubber, $git, release: $release),
             $queue,
             new Sender($config, $queue, $transport ?? new DirectTransport($config), $logger, $clock),
             new RateGate($config->fingerprintCap, $config->fingerprintWindowMs, $clock),

@@ -56,6 +56,8 @@ final class EventFactory
      */
     private const MAX_TAGS = 29;
 
+    private readonly Release $release;
+
     public function __construct(
         private readonly Config $config,
         private readonly Scrubber $scrubber,
@@ -63,7 +65,13 @@ final class EventFactory
         private readonly string $sdkName = 'anvil-feed-php',
         private readonly string $sdkVersion = self::SDK_VERSION,
         private readonly string $language = 'php',
+        /**
+         * The release every event carries, resolved once by the caller ({@see Release::discover()} with the
+         * application root). Absent, what config and git already know, without touching the filesystem.
+         */
+        ?Release $release = null,
     ) {
+        $this->release = $release ?? Release::known($config->release, $git);
         // Resolved ONCE, at init: a discovery per frame would probe the filesystem on the capture path.
         $this->projectRoot = self::normalizeRoot($config->projectRoot ?? self::discoverProjectRoot());
     }
@@ -180,9 +188,8 @@ final class EventFactory
             'exception' => $exception,
         ];
 
-        $release = $this->config->release ?? $this->git->release;
-        if ($release !== null) {
-            $payload['release'] = $release;
+        if ($this->release->value !== null) {
+            $payload['release'] = $this->release->value;
         }
         if (isset($context['request']) && is_array($context['request']) && $context['request'] !== []) {
             // The URL goes in as it came. It is scrubbed (userinfo and parameters) by Scrubber::scrubUrl
