@@ -23,7 +23,7 @@ final class EventFactory
      * must not exist twice: Task 11's release check pins THIS constant against the released tag, and the
      * constructor default below is the only other place it is spelled.
      */
-    public const SDK_VERSION = '0.1.0';
+    public const SDK_VERSION = '0.1.1';
 
     /**
      * The User-Agent BOTH transports send, derived here so the version is spelled once in this SDK

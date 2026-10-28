@@ -239,7 +239,7 @@ final class DirectTransportTest extends TestCase
         self::assertSame('application/json', $echoed['headers']['content-type'] ?? null);
         self::assertSame('Bearer anv_srv_0123456789abcdef0123456789abcdef',
             $echoed['headers']['authorization'] ?? null);
-        self::assertSame('anvil-feed-php/0.1.0', $echoed['headers']['user-agent'] ?? null);
+        self::assertSame('anvil-feed-php/0.1.1', $echoed['headers']['user-agent'] ?? null);
         self::assertArrayNotHasKey('origin', $echoed['headers'],
             'an Origin header makes the ingest answer 403 and treat the server token as leaked (FR-9f)');
         self::assertNull($response->retryAfterSeconds);

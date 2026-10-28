@@ -61,7 +61,7 @@ final class PsrTransportTest extends TestCase
         self::assertSame('application/json', $client->seen->getHeaderLine('Content-Type'));
         self::assertSame('Bearer anv_srv_0123456789abcdef0123456789abcdef',
             $client->seen->getHeaderLine('Authorization'));
-        self::assertSame('anvil-feed-php/0.1.0', $client->seen->getHeaderLine('User-Agent'));
+        self::assertSame('anvil-feed-php/0.1.1', $client->seen->getHeaderLine('User-Agent'));
         self::assertFalse($client->seen->hasHeader('Origin'),
             'an Origin header makes the ingest answer 403 and treat the server token as leaked (FR-9f)');
         self::assertSame('{"a":1}', (string) $client->seen->getBody());
